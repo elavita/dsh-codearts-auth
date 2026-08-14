@@ -72,4 +72,8 @@ export function apply(ctx: Context): void {
     },
     refresh: () => service.refresh(),
   })
+
+  // 启动时若已有可刷新凭据，安排静默续期；插件卸载时停止调度（保留凭据）。
+  service.scheduleRefresh()
+  ctx.effect(() => () => service.stop(), 'codearts-auth.scheduler')
 }

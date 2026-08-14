@@ -1,13 +1,21 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   buildLoginUrl,
+  buildOAuthLoginUrl,
+  buildPortalLoginResultUrl,
   expiresFromCredential,
   generateRandomSecret,
+  LOGIN_PLUGIN_NAME,
+  LOGIN_PLUGIN_VERSION,
   parseCredentialResponse,
   pollForCredential,
+  PORTAL_AUTHORIZE_BASE,
   runLoginFlow,
+  runOAuthFlow,
   startCallbackServer,
+  startOAuthCallbackServer,
 } from '../../src/login.js'
+import { generateDpopKeyPair } from '../../src/oauth.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 describe('generateRandomSecret', () => {
@@ -223,3 +231,134 @@ async function waitFor<T>(get: () => T | undefined, timeoutMs = 5000): Promise<T
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 }
+
+describe('buildOAuthLoginUrl', () => {
+  it('matches the reverse-engineered portal authorize parameters', () => {
+    const pkce = { codeVerifier: 'VERIFIER', codeChallenge: 'CHALLENGE' }
+    const url = buildOAuthLoginUrl(43123, pkce, 'a'.repeat(64))
+    expect(url).toBe(
+      `${PORTAL_AUTHORIZE_BASE}?theme=${'2'}&locale=${'zh-cn'}`
+      + '&uri_scheme=codearts-agent&client_id=codearts-agent&port=43123'
+      // code_challenge_method 对齐真实插件（SHA-256 而非 S256）。
+      + '&code_challenge=CHALLENGE&code_challenge_method=SHA-256'
+      + `&ticket_id=${'a'.repeat(64)}&plugin-name=${LOGIN_PLUGIN_NAME}&plugin-version=${LOGIN_PLUGIN_VERSION}`,
+    )
+  })
+})
+
+describe('startOAuthCallbackServer', () => {
+  it('exchanges the authorization code and resolves the stored credential JSON', async () => {
+    // 模拟 STS 端点：返回完整凭据。
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      credentials: {
+        access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+        expiration: '2026-08-15T00:00:00Z',
+      },
+      refresh_token: 'RT',
+    }), { status: 200 }))
+    const pkce = { codeVerifier: 'VERIFIER', codeChallenge: 'CHALLENGE' }
+    const keyPair = await generateDpopKeyPair()
+    const { port, server, result } = await startOAuthCallbackServer('ticket-123', pkce, keyPair, { fetcher: fetcher as unknown as typeof fetch })
+
+    // 以真实 HTTP 请求触发回调：/oauth/callback?code=CODE
+    // redirect: 'manual' —— 不自动跟随 307，以便断言重定向本身。
+    const res = await fetch(`http://127.0.0.1:${port}/oauth/callback?code=CODE`, { redirect: 'manual' })
+    expect(res.status).toBe(307)
+    // 换取成功后浏览器被 307 重定向到 portal 登录结果页（对齐真实插件）。
+    expect(res.headers.get('location')).toBe(buildPortalLoginResultUrl(true))
+    const outcome = await result
+    const credential = JSON.parse(outcome.access) as Record<string, string>
+    expect(credential).toMatchObject({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-08-15T00:00:00Z', refresh_token: 'RT', code_verifier: 'VERIFIER',
+    })
+    await new Promise((resolve) => server.close(resolve))
+  })
+
+  it('falls back to the legacy ticket poll when the portal sends a secret callback', async () => {
+    // 模拟 snap-manager ticket 端点：返回完整凭据（旧流程回退路径）。
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      credential: {
+        access: 'AK', secret: 'SK', securitytoken: 'ST',
+        expires_at: '2026-08-15T00:00:00Z',
+      },
+      user_id: 'u-1', user_name: 'tester', domain_id: 'd-1',
+    }), { status: 200 }))
+    const pkce = { codeVerifier: 'VERIFIER', codeChallenge: 'CHALLENGE' }
+    const keyPair = await generateDpopKeyPair()
+    const { port, server, result } = await startOAuthCallbackServer('ticket-123', pkce, keyPair, { fetcher: fetcher as unknown as typeof fetch })
+
+    // 以真实 HTTP 请求触发回调：/oauth/callback?secret=<portal secret>&redirect=<portal login 页>
+    const redirectTarget = 'https://codearts.huaweicloud.com/portal/login?login_succeed=true&uri_scheme=codearts-agent&locale=zh-cn'
+    const res = await fetch(`http://127.0.0.1:${port}/oauth/callback?secret=PORTAL-SECRET&redirect=${encodeURIComponent(redirectTarget)}`, { redirect: 'manual' })
+    expect(res.status).toBe(307)
+    // 旧流程回退：立即 307 重定向到 portal 回传的 redirect 地址（对齐真实插件）。
+    expect(res.headers.get('location')).toBe(redirectTarget)
+    const outcome = await result
+    const credential = JSON.parse(outcome.access) as Record<string, string>
+    expect(credential.access_key_id).toBe('AK')
+    expect(credential.security_token).toBe('ST')
+    // 旧流程凭据无 refresh_token → refreshable 由服务层判定为 false。
+    expect(credential.refresh_token).toBeUndefined()
+    // 轮询请求头使用新式插件名（对齐真实插件的 snap_AIIDE/5.2.0）。
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
+    expect(url).toContain('/v1/login/ticket')
+    const headers = init.headers as Record<string, string>
+    expect(headers['plugin-name']).toBe(LOGIN_PLUGIN_NAME)
+    expect(headers['plugin-version']).toBe(LOGIN_PLUGIN_VERSION)
+    await new Promise((resolve) => server.close(resolve))
+  })
+
+  it('responds 400 without an authorization code or secret', async () => {
+    const pkce = { codeVerifier: 'V', codeChallenge: 'C' }
+    const keyPair = await generateDpopKeyPair()
+    const { port, server } = await startOAuthCallbackServer('ticket-123', pkce, keyPair, {})
+    const res = await fetch(`http://127.0.0.1:${port}/oauth/callback`)
+    expect(res.status).toBe(400)
+    await new Promise((resolve) => server.close(resolve))
+  })
+
+  it('listens on a callback port >= 10000 (portal requirement)', async () => {
+    const pkce = { codeVerifier: 'V', codeChallenge: 'C' }
+    const keyPair = await generateDpopKeyPair()
+    const { port, server } = await startOAuthCallbackServer('ticket-123', pkce, keyPair, {})
+    expect(port).toBeGreaterThanOrEqual(10_000)
+    await new Promise((resolve) => server.close(resolve))
+  })
+})
+
+describe('runOAuthFlow', () => {
+  it('opens the login URL, exchanges the code and returns access/expires/loginUrl', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      credentials: {
+        access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+        expiration: '2026-08-15T00:00:00Z',
+      },
+      refresh_token: 'RT',
+    }), { status: 200 }))
+    const opened: string[] = []
+    const openBrowser = (url: string) => { opened.push(url) }
+    // runOAuthFlow 会 await openBrowser 的返回值；同步返回即可。
+    const flowPromise = runOAuthFlow({ fetcher: fetcher as unknown as typeof fetch, openBrowser })
+
+    // 等待回调服务器就绪（runOAuthFlow 内部先起服务器再开浏览器）——用短轮询。
+    await vi.waitFor(async () => {
+      expect(opened.length).toBe(1)
+    }, { timeout: 2000 })
+    const loginUrl = opened[0]
+    const url = new URL(loginUrl)
+    const codeChallenge = url.searchParams.get('code_challenge')
+    expect(codeChallenge).toBeTruthy()
+    // 从打开的 URL 解析端口并发起回调。
+    const port = url.searchParams.get('port')
+    const res = await fetch(`http://127.0.0.1:${port}/oauth/callback?code=CODE`, { redirect: 'manual' })
+    expect(res.status).toBe(307)
+    expect(res.headers.get('location')).toBe(buildPortalLoginResultUrl(true))
+
+    const outcome = await flowPromise
+    expect(outcome.loginUrl).toBe(loginUrl)
+    expect(outcome.expires).toBe(Date.parse('2026-08-15T00:00:00Z'))
+    const credential = JSON.parse(outcome.access) as Record<string, string>
+    expect(credential.refresh_token).toBe('RT')
+  })
+})

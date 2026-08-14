@@ -1,6 +1,12 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { runLoginFlow } from './login.js'
+import { runLoginFlow, runOAuthFlow } from './login.js'
+import {
+  RefreshTokenExpiredError,
+  credentialFromTokenResponse,
+  exchangeRefreshToken,
+  keyPairFromStoredJwk,
+} from './oauth.js'
 import { RefreshScheduler } from './refresh.js'
 import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult } from './types.js'
 
@@ -17,6 +23,8 @@ export interface LoginResult {
   ref: CredentialRef
   /** 打开的登录 URL。 */
   loginUrl: string
+  /** 凭据是否携带 refresh_token（新式 OAuth 流程为 true）。 */
+  refreshable: boolean
 }
 
 /** 用于配置界面的只读登录状态。 */
@@ -24,7 +32,7 @@ export interface LoginStatus {
   configured: boolean
   source?: string
   expiresAt?: number
-  /** 存储的凭据是否可通过重新执行登录流程来续期。 */
+  /** 存储的凭据是否可通过刷新令牌静默续期。 */
   refreshable: boolean
   /** 最近一次刷新失败的原因（如有）。 */
   refreshError?: string
@@ -36,88 +44,150 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-/** CodeArts 浏览器登录服务：运行 ticket 流程、持久化存储，并在过期前重新登录。 */
+/** 从存储值解析凭据 JSON；解析失败返回 undefined。 */
+function parseCredential(value: string): CodeArtsCredential | undefined {
+  try {
+    return JSON.parse(value) as CodeArtsCredential
+  } catch {
+    return undefined
+  }
+}
+
+/** CodeArts 登录服务：默认新式 IAM OAuth，ticket 流程回退，refresh_token 静默续期。 */
 export class CodeArtsAuth extends Service {
   private readonly scheduler = new RefreshScheduler(
-    () => this.refresh().catch(() => {}),
-    (error) => { this.lastRefreshError = error instanceof Error ? error.message : String(error) },
+    () => this.refresh(),
+    (error) => {
+      if (error instanceof RefreshTokenExpiredError) {
+        // 失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。
+        this.markRefreshTokenInvalid()
+        return
+      }
+      this.lastRefreshError = error instanceof Error ? error.message : String(error)
+    },
   )
+  /** refresh_token 已被后端判定失效（InvalidGrant）；登录/刷新成功时重置。 */
+  private refreshTokenInvalid = false
   private lastRefreshError: string | undefined
+  /** 登录会话是否仍处于活跃状态；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
+  private active = true
 
-  constructor(ctx: Context) {
-    super(ctx, 'codeartsAuth')
+  /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。 */
+  private markRefreshTokenInvalid(): void {
+    this.refreshTokenInvalid = true
+    this.lastRefreshError = 'refresh_token 已失效，请重新登录'
   }
 
-  /** 运行登录流程并持久化存储所得凭据。 */
-  async login(options?: LoginFlowOptions): Promise<LoginResult> {
+  constructor(ctx: Context, options: { fetcher?: typeof fetch } = {}) {
+    super(ctx, 'codeartsAuth')
+    if (options.fetcher) this.fetchImpl = options.fetcher
+  }
+
+  /** 运行登录流程（默认新式 OAuth；flow: 'ticket' 走旧流程回退）并持久化凭据。 */
+  async login(options: { flow?: 'oauth' | 'ticket' } & LoginFlowOptions = {}): Promise<LoginResult> {
+    this.active = true
     const ref = credentialRef(CODEARTS_CREDENTIAL_REF)
-    const flow: LoginFlowResult = await runLoginFlow(options)
+    const flow: LoginFlowResult = options.flow === 'ticket'
+      ? await runLoginFlow(options)
+      : await runOAuthFlow(options)
     await this.ctx.credentials.set(ref, flow.access)
+    this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
     this.scheduleRefresh()
-    return { access: flow.access, expires: flow.expires, ref, loginUrl: flow.loginUrl }
+    const credential = parseCredential(flow.access)
+    return {
+      access: flow.access,
+      expires: flow.expires,
+      ref,
+      loginUrl: flow.loginUrl,
+      refreshable: Boolean(credential?.refresh_token),
+    }
   }
 
-  /** 报告凭据是否已配置、过期时间以及是否可刷新。 */
+  /** 报告凭据是否已配置、过期时间、是否可刷新以及最近刷新错误。 */
   async status(): Promise<LoginStatus> {
     const ref = credentialRef(CODEARTS_CREDENTIAL_REF)
     const info = await this.ctx.credentials.describe(ref)
     if (!info.configured) return { configured: false, refreshable: false }
     let expiresAt: number | undefined
+    let refreshable = false
     const resolved = await this.ctx.credentials.resolve(ref)
     if (resolved) {
-      try {
-        const parsed = JSON.parse(resolved.value) as CodeArtsCredential
-        if (parsed.expires_at) {
-          const parsedDate = Date.parse(parsed.expires_at)
+      const credential = parseCredential(resolved.value)
+      if (credential) {
+        if (credential.expires_at) {
+          const parsedDate = Date.parse(credential.expires_at)
           if (!Number.isNaN(parsedDate)) expiresAt = parsedDate
         }
-      } catch {
-        /* 原始令牌凭据不携带过期元数据 */
+        refreshable = Boolean(credential.refresh_token) && !this.refreshTokenInvalid
       }
     }
     return {
       configured: true,
       source: info.source,
       expiresAt,
-      refreshable: true,
+      refreshable,
       ...this.lastRefreshError === undefined ? {} : { refreshError: this.lastRefreshError },
     }
   }
 
-  /**
-   * 通过重新执行浏览器登录流程来续期凭据。旧版
-   * ticket 流程签发的短时凭据不含刷新令牌，因此
-   * 续期意味着重新登录（用户需在浏览器中再次授权）；
-   * 调度器会在过期前不久触发此方法。
-   */
+  /** 静默续期：refresh_token 换取；无 refresh_token 时明确报错（由命令提示重新登录）。 */
   async refresh(): Promise<void> {
     const ref = credentialRef(CODEARTS_CREDENTIAL_REF)
-    const flow: LoginFlowResult = await runLoginFlow({ fetcher: this.fetchImpl })
-    await this.ctx.credentials.set(ref, flow.access)
-    this.lastRefreshError = undefined
-    this.scheduleRefresh()
+    const resolved = await this.ctx.credentials.resolve(ref)
+    if (!resolved) throw new Error('未配置凭据，请先登录')
+    const credential = parseCredential(resolved.value)
+    if (!credential?.refresh_token || !credential.code_verifier || !credential.dpop_private_key_jwk) {
+      throw new Error('无 refresh_token，请重新登录')
+    }
+    const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
+    try {
+      const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
+      // 登出竞态保护：在途刷新期间已 logout()/stop() 时，跳过凭据回写与调度武装，
+      // 避免已登出的凭据被在途刷新复活。
+      if (!this.active) return
+      const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+      // 保留无变化字段（domain_id/user_id/user_name 等）。
+      refreshed.domain_id = credential.domain_id
+      refreshed.user_id = credential.user_id
+      refreshed.user_name = credential.user_name
+      await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+      this.refreshTokenInvalid = false
+      this.lastRefreshError = undefined
+      this.scheduleRefresh()
+    } catch (error) {
+      // 手动 refresh()（或 llm-adapter 触发）遇 refresh_token 失效同样更新状态，
+      // 供 /codearts-status 展示 refreshable: false 与重新登录提示。
+      if (error instanceof RefreshTokenExpiredError) this.markRefreshTokenInvalid()
+      throw error
+    }
   }
 
   /** 移除已存储的凭据并停止任何待处理的刷新。 */
   async logout(): Promise<void> {
+    // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
+    this.active = false
     this.scheduler.stop()
     await this.ctx.credentials.unset(credentialRef(CODEARTS_CREDENTIAL_REF))
   }
 
-  /** 用于测试的可注入 fetch；默认为全局 fetch。 */
-  private fetchImpl: typeof fetch = fetch
+  /** 停止刷新调度（不清理凭据）。 */
+  stop(): void {
+    this.active = false
+    this.scheduler.stop()
+  }
 
-  private scheduleRefresh(): void {
+  /** 启动时若已有可刷新凭据则安排续期（由 apply 调用）。 */
+  scheduleRefresh(): void {
     void this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF)).then((resolved) => {
       if (!resolved) return
-      try {
-        const credential = JSON.parse(resolved.value) as CodeArtsCredential
-        const expiresAt = Date.parse(credential.expires_at)
-        if (!Number.isNaN(expiresAt)) this.scheduler.arm(expiresAt)
-      } catch {
-        /* 不可刷新；忽略 */
-      }
+      const credential = parseCredential(resolved.value)
+      if (!credential?.expires_at || !credential.refresh_token) return
+      const expiresAt = Date.parse(credential.expires_at)
+      if (!Number.isNaN(expiresAt)) this.scheduler.arm(expiresAt)
     })
   }
+
+  /** 用于测试的可注入 fetch；默认为全局 fetch。 */
+  private fetchImpl: typeof fetch = fetch
 }

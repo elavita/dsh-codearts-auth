@@ -2,14 +2,16 @@ import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
 import { apply } from '../../src/index.js'
-import { runLoginFlow } from '../../src/login.js'
+import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
 import { CodeArtsAuth } from '../../src/service.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
+  runOAuthFlow: vi.fn(),
 }))
 
 const mockedRunLoginFlow = vi.mocked(runLoginFlow)
+const mockedRunOAuthFlow = vi.mocked(runOAuthFlow)
 
 class FakeCredentials {
   private store = new Map<string, string>()
@@ -68,7 +70,7 @@ describe('plugin entry', () => {
   })
 
   it('command handler reports success with ref and expiry', async () => {
-    mockedRunLoginFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
+    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
     const { ctx, commands } = makeContext()
     apply(ctx)
     const login = commands.definitions.find((d) => d.name === 'codearts-login')!
@@ -83,7 +85,7 @@ describe('plugin entry', () => {
   })
 
   it('command handler reports a failure as an error result', async () => {
-    mockedRunLoginFlow.mockRejectedValue(new Error('CodeArts login timed out'))
+    mockedRunOAuthFlow.mockRejectedValue(new Error('CodeArts login timed out'))
     const { ctx, commands } = makeContext()
     apply(ctx)
     const login = commands.definitions.find((d) => d.name === 'codearts-login')!
@@ -107,7 +109,7 @@ describe('plugin entry', () => {
   })
 
   it('codearts-status reports refreshability', async () => {
-    mockedRunLoginFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
+    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
     const { ctx, commands } = makeContext()
     apply(ctx)
     const status = commands.definitions.find((d) => d.name === 'codearts-status')!
@@ -118,5 +120,13 @@ describe('plugin entry', () => {
       signal: new AbortController().signal,
     })
     expect(result).toMatchObject({ kind: 'success' })
+  })
+
+  it('stops the refresh scheduler when the plugin context is disposed', async () => {
+    const { ctx } = makeContext()
+    apply(ctx)
+    const stopSpy = vi.spyOn(ctx.codeartsAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(stopSpy).toHaveBeenCalled()
   })
 })
