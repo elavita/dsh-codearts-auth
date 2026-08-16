@@ -32,8 +32,9 @@ dsh plugin add dsh-codearts-auth
 插件在 `ctx.llm` 上注册了一个 `codearts` provider 路由（OpenAI 兼容端点
 `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2`）。每个模型请求都使用
 存储的 AK/SK/SecurityToken 按华为 `SDK-HMAC-SHA256` 方案签名，并附带
-`Chat-Id`/`Session-Id` 请求头。默认广告的模型为 GLM-5.2、GLM-5.1 和
-GLM-5。登录后在 dsh Models 页面选择该 provider 即可。
+`Chat-Id`/`Session-Id` 请求头。默认广告的模型为 GLM-5.2、GLM-5.1、
+GLM-5 以及盘古 openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)。
+登录后在 dsh Models 页面选择该 provider 即可。
 
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
