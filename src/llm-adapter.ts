@@ -174,6 +174,18 @@ export class CodeArtsAdapter extends LlmAdapter {
       model: options.model,
       messages,
       stream: true,
+      // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
+      // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
+      // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
+      // （error decoding response body）。
+      tool_stream: true,
+      // 输出上限（对齐 deveco-code-rust 参考实现 codearts.rs 的 max_tokens 配置）：
+      // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
+      // 若沿用后端默认输出上限，参数 JSON 会在中途被截断成非法 JSON，harness
+      // 工具校验报 `invalid arguments: "arguments" must be an object`。
+      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
+      // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
+      max_tokens: options.maxTokens ?? 65536,
       ...tools !== undefined && tools.length > 0 ? { tools } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
