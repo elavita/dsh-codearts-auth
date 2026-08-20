@@ -40,19 +40,29 @@ describe('CodeArtsAdapter', () => {
     expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
   })
 
-  it('listModels advertises the openpangu-2.0 models alongside the GLM family', async () => {
+  it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {
     // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
     // openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
     // 后端 /v1/default/models 下发的 model_id 为全小写。
+    // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
+    // deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费 Tokens 福利）。
+    // e2e 实测确认后端实际注册的 flash ID 是 deepseek-v4-flash（无 -0731 后缀），
+    // IDE 显示的 deepseek-v4-flash-0731 后端返回 404 not registered。
     const models = await makeAdapter().listModels('codearts')
     const ids = models.map(model => model.id)
     expect(ids).toContain('openpangu-2.0-flash')
     expect(ids).toContain('openpangu-2.0-pro')
+    expect(ids).toContain('deepseek-v4-flash')
+    expect(ids).toContain('deepseek-v4-pro')
     const flash = models.find(model => model.id === 'openpangu-2.0-flash')
     const pro = models.find(model => model.id === 'openpangu-2.0-pro')
+    const dsFlash = models.find(model => model.id === 'deepseek-v4-flash')
+    const dsPro = models.find(model => model.id === 'deepseek-v4-pro')
     expect(flash).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-flash' })
     expect(pro).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-pro' })
-    // 默认模型仍是 GLM-5.2（新增 openpangu 不应改变默认模型）。
+    expect(dsFlash).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-flash' })
+    expect(dsPro).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-pro' })
+    // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
     expect(ids[0]).toBe('GLM-5.2')
   })
 

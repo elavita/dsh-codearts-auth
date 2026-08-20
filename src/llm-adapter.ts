@@ -11,7 +11,18 @@ import type { CodeArtsCredential } from './types.js'
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
 
-const DEFAULT_MODELS: readonly string[] = ['GLM-5.2', 'GLM-5.1', 'GLM-5', 'openpangu-2.0-flash', 'openpangu-2.0-pro']
+// DeepSeek V4（CodeArts Agent 模型列表新增，UI 标注"每日 1000 万免费 Tokens"福利）：
+// e2e 实测（2026-08-20，对齐 deveco-code 62834ff6）后端实际注册的模型 ID：
+// - deepseek-v4-flash（无日期后缀）✅ 可直接收发消息
+// - deepseek-v4-flash-0731（IDE 列表显示的带日期后缀 ID）❌ 后端返回
+//   InferHub.002002009.404 "The model is not registered"——后端未注册此 ID
+// - deepseek-v4-pro ✅ 可直接收发消息
+// 结论：IDE 模型列表显示的 flash ID 与后端实际注册 ID 不一致，使用无后缀的 deepseek-v4-flash。
+const DEFAULT_MODELS: readonly string[] = [
+  'GLM-5.2', 'GLM-5.1', 'GLM-5',
+  'openpangu-2.0-flash', 'openpangu-2.0-pro',
+  'deepseek-v4-flash', 'deepseek-v4-pro',
+]
 
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef

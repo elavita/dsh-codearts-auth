@@ -2,3 +2,13 @@ docs/superpowers
 node_modules/
 lib/
 *.tsbuildinfo
+
+# e2e 运行产物与临时脚本
+.e2e-logs/
+.e2e-run*.cjs
+.e2e-run*.mjs
+.tmp-*.mjs
+.atomcode/
+.deveco/
+-1
+stderr.log']
