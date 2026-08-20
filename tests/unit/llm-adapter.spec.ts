@@ -105,6 +105,66 @@ describe('CodeArtsAdapter', () => {
     expect(texts).toEqual(['ok'])
   })
 
+  it('refreshes the credential once when the chat request fails with APIG.0602 and retries successfully', async () => {
+    // CodeArts 经华为 APIG 网关鉴权：SecurityToken 过期/无效时网关返回
+    // APIG.0602 "Invalid token"。入口的 expires_at 预判无法覆盖后端提前
+    // 吊销或时钟偏差，stream() 应在收到该错误后触发一次静默 refresh，
+    // 用新凭据重试 chat 请求；最多 refresh 一次，避免死循环。
+    let refreshed = false
+    let chatCalls = 0
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith(QUEUE_STATUS_BASE)) {
+        return new Response(JSON.stringify({ status: 'working', queue_position: 0, message: '' }))
+      }
+      chatCalls += 1
+      if (chatCalls === 1) {
+        return new Response(JSON.stringify({ error_code: 'APIG.0602', error_msg: 'Invalid token' }), { status: 401 })
+      }
+      // 第二次请求在 refresh 后发出，应使用刷新后的凭据（makeAdapter 的
+      // refresh() 会把 credential 恢复为 validCredential）。
+      const headers = new Headers(init?.headers)
+      expect(headers.get('x-security-token')).toBe('ST')
+      expect(refreshed).toBe(true)
+      return new Response('data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+    })
+    const adapter = makeAdapter({
+      refresh: async () => { refreshed = true },
+      fetchImpl,
+    })
+    const texts: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+    expect(chatCalls).toBe(2)
+    expect(refreshed).toBe(true)
+    expect(texts).toEqual(['recovered'])
+  })
+
+  it('does not refresh more than once on repeated auth errors', async () => {
+    // 连续两次 APIG.0602：第一次触发 refresh+重试，第二次仍失败应直接抛 AUTH，
+    // 不再刷新，避免死循环。
+    let refreshCount = 0
+    let chatCalls = 0
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.startsWith(QUEUE_STATUS_BASE)) {
+        return new Response(JSON.stringify({ status: 'working', queue_position: 0, message: '' }))
+      }
+      chatCalls += 1
+      return new Response(JSON.stringify({ error_code: 'APIG.0602', error_msg: 'Invalid token' }), { status: 401 })
+    })
+    const adapter = makeAdapter({
+      refresh: async () => { refreshCount += 1 },
+      fetchImpl,
+    })
+    await expect(async () => {
+      for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+    }).rejects.toMatchObject({ code: 'AUTH' })
+    expect(chatCalls).toBe(2)
+    expect(refreshCount).toBe(1)
+  })
+
   it('throws MISSING_CREDENTIAL when no credential is available', async () => {
     // 直接构建适配器：makeAdapter 的 refresh() 会恢复
     // 有效凭据，因此"刷新后仍无凭据"需要用原始适配器。

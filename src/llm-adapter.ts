@@ -143,6 +143,20 @@ function isQueueError(status: number, body: string): boolean {
 }
 
 /**
+ * 判断 HTTP 错误是否表示凭据已失效、可通过 refresh_token 续期后重试。
+ * CodeArts 经华为 APIG 网关鉴权：SecurityToken 过期/无效时网关返回
+ * `APIG.0602`（"Invalid token"），HTTP 状态通常是 401，但也观察到 403。
+ * 本适配器在入口已按 expires_at 预判过期，但 SecurityToken 可能被后端
+ * 提前吊销、或本地时钟与签发端有偏差——此时首次请求会命中本错误。
+ * 策略：触发一次静默 refresh，用新 AK/SK/SecurityToken 重试一次；仍失败
+ * 才抛 AUTH，避免把可自愈的瞬时鉴权失败暴露给用户。
+ */
+function isAuthError(status: number, body: string): boolean {
+  if (status === 401 || status === 403) return true
+  return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
+}
+
+/**
  * 判断 SSE 流内返回的 error_code 是否属于可重试的排队/限流错误。
  * CodeArts 以 HTTP 200 + SSE 内嵌 `error_code` 返回这类错误（例如
  * `InferHub.ModelArts.81111.429` TPM 每分钟 token 超限），而不是 4xx——
@@ -278,6 +292,9 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 上限 QUEUE_MAX_ATTEMPTS 次（180 × 10s = 30 分钟）。
     let response: Response
     let queueAttempts = 0
+    // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
+    // 同一次 stream() 调用最多 refresh 一次。
+    let authRefreshed = false
     for (;;) {
       const signed = await signRequestHuawei(
         credential.access_key_id,
@@ -314,6 +331,18 @@ export class CodeArtsAdapter extends LlmAdapter {
         }
       } else {
         const errorText = await response.text().catch(() => '')
+        // 鉴权失败（SecurityToken 过期/被吊销/APIG.0602）：刷新一次凭据后
+        // 重试整个 chat 请求。入口的 expires_at 预判无法覆盖后端提前吊销
+        // 或时钟偏差场景，这里做兜底，避免把可自愈的鉴权失败抛给用户。
+        if (isAuthError(response.status, errorText) && !authRefreshed) {
+          authRefreshed = true
+          await this.options.refresh()
+          credential = await this.options.resolveCredential()
+          if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
+            throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL')
+          }
+          continue
+        }
         if (!isQueueError(response.status, errorText)) {
           // 非 TM.00001041 错误也未必没排队：openpangu 等模型的并发限流
           // 错误码/HTTP 状态可能与 GLM 不同，但仍会进入后端队列。先探测
