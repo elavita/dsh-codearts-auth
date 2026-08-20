@@ -66,6 +66,22 @@ describe('CodeArtsAdapter', () => {
     expect(ids[0]).toBe('GLM-5.2')
   })
 
+  it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
+    // GLM-5.2：202752；deepseek-v4-flash/pro：1048576（1M）。
+    // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+    const adapter = makeAdapter()
+    const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
+    expect(glm52.context).toEqual({ contextWindow: 202752 })
+    const dsFlash = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
+    expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
+    const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
+    expect(dsPro.context).toEqual({ contextWindow: 1048576 })
+    const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
+    expect(glm51.context).toBeUndefined()
+    const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
+    expect(pangu.context).toBeUndefined()
+  })
+
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
     const fetchImpl = vi.fn(async () => new Response(
       'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'

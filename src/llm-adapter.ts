@@ -4,7 +4,7 @@ import {
   attributionHeaders, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
   isQuotaExceededError, LlmAdapter, LlmError, QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { signRequestHuawei } from './sign.js'
 import type { CodeArtsCredential } from './types.js'
 
@@ -23,6 +23,16 @@ const DEFAULT_MODELS: readonly string[] = [
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
   'deepseek-v4-flash', 'deepseek-v4-pro',
 ]
+
+// 模型上下文窗口（最大合并请求+响应 token 数）。
+// - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
+// - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
+// - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
+  ['GLM-5.2', 202752],
+  ['deepseek-v4-flash', 1048576],
+  ['deepseek-v4-pro', 1048576],
+])
 
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
@@ -241,6 +251,13 @@ export class CodeArtsAdapter extends LlmAdapter {
 
   listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve(DEFAULT_MODELS.map((id) => ({ provider: PROVIDER, id, name: id, inputModalities: ['text'] })))
+  }
+
+  resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    const contextWindow = CONTEXT_WINDOWS.get(model)
+    const resolved: LlmResolvedModelInfo = { provider, id: model, name: model }
+    if (contextWindow !== undefined) resolved.context = { contextWindow }
+    return Promise.resolve(resolved)
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
