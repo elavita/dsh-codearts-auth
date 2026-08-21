@@ -62,10 +62,12 @@ function contentToText(content: unknown): string {
 
 /**
  * 将 harness 对话消息序列化为 CodeArts chat-completions 的传输
- * 格式。助手的 `tool-call` 块转换为 `tool_calls` 字段；工具
- * 结果（搭载在 harness 用户消息中）展开为独立的
- * `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
- * 非文本块（推理、图片）被丢弃，与端点接受的格式一致。
+ * 格式。助手的 `tool-call` 块转换为 `tool_calls` 字段；`reasoning`
+ * 块折叠为 `reasoning_content` 字段（deepseek-v4 等推理模型的后端
+ * 校验要求 assistant 消息必须携带该字段，缺失会报 "Missing
+ * `reasoning_content` field"）；工具结果（搭载在 harness 用户消息中）
+ * 展开为独立的 `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
+ * 其余非文本块（图片）被丢弃，与端点接受的格式一致。
  */
 function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
@@ -80,9 +82,19 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
           type: 'function' as const,
           function: { name: String(block.name), arguments: String(block.arguments) },
         }))
+      const reasoning = content
+        .filter((block): block is { type: string; text: unknown } =>
+          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
+        .map((block) => String(block.text))
+        .join('')
       wire.push({
         role: 'assistant',
         content: contentToText(content),
+        // 后端（deepseek-v4-flash/pro）校验要求 assistant 消息必须包含
+        // reasoning_content 字段：历史里的推理块在上一轮被持久化，回传时
+        // 若缺失该字段会直接 400（"Missing `reasoning_content` field"）。
+        // 始终携带该字段（无推理时为空串），确保字段存在。
+        reasoning_content: reasoning,
         ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
       })
       continue

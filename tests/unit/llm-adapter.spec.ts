@@ -585,4 +585,37 @@ describe('CodeArtsAdapter', () => {
     for await (const _ of adapter.stream(opts)) { /* drain */ }
     expect(fetchImpl).toHaveBeenCalled()
   })
+
+  it('replays assistant reasoning blocks as reasoning_content for the model', async () => {
+    // deepseek-v4 等推理模型后端校验：回传历史时 assistant 消息必须携带
+    // reasoning_content 字段，缺失会 400 "Missing `reasoning_content` field"。
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<Record<string, unknown>>
+      }
+      const wire = sent.messages ?? []
+      const first = wire.find(message => message.role === 'assistant') as Record<string, unknown> | undefined
+      expect(first?.content).toBe('visible-answer')
+      expect(first?.reasoning_content).toBe('hidden-thought')
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: 'summarize' },
+        { role: 'assistant', content: [
+          { type: 'reasoning', text: 'hidden-thought' },
+          { type: 'text', text: 'visible-answer' },
+        ] },
+      ],
+      signal: new AbortController().signal,
+    } as never
+    for await (const _ of adapter.stream(opts)) { /* drain */ }
+    expect(fetchImpl).toHaveBeenCalled()
+  })
 })
