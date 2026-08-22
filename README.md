@@ -8,21 +8,45 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 ## 安装
 
-该包尚未发布到 npm registry，请用 **git URL** 安装。`dsh plugin` 会把参数转发给
-pnpm（见 `@deepseek-ai/dsh` 的 `README.zh.md`），pnpm 支持 git 依赖，并在 git
-安装时自动执行 `prepare` 脚本（即 `pnpm build`）构建 `lib/`：
+该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
+并构建）和**源码目录安装**（本地开发联调）。
 
-```sh
-dsh plugin --profile <name> add git+ssh://git@gitee.com/iJetLi/deepseek-harness-codearts.git
+### 方式一：从 git 仓库安装（推荐）
+
+先在 profile 的 `pnpm-workspace.yaml` 中放行该包的 build 脚本
+（路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）：
+
+```yaml
+allowBuilds:
+  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git: true
 ```
 
-指定分支或 tag 安装（默认 `#HEAD`，本仓库分支为 `master`）：
+再用 `dsh plugin add` 从 gitee 拉取并安装：
 
 ```sh
-dsh plugin --profile <name> add git+ssh://git@gitee.com/iJetLi/deepseek-harness-codearts.git#master
+dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
 ```
 
-> 安装前请确保远端已推送最新提交（含大文件写入修复）。
+`add` 以 `git+https` 方式安装，pnpm 会运行 `prepare` 脚本自动构建 `lib/`，无需
+手动 `pnpm build`。每次升级时重新 `add` 即可拉取最新版本并重建。
+
+### 方式二：从源码目录安装（本地开发）
+
+先在本仓库中构建 `lib/`，再用 `dsh plugin install` 将本地检出安装为 pnpm `link:`
+依赖（指向本目录）：
+
+```sh
+pnpm build
+dsh plugin --profile <name> install <path-to-this-repo>
+```
+
+> `dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:` 依赖运行
+> `prepare` 脚本，因此必须先手动执行 `pnpm build` 生成 `lib/`，否则 dsh 启动时
+> 报 `ERR_MODULE_NOT_FOUND: ... dsh-codearts-auth/lib/index.js`。
+
+每次修改 `src/` 后都需要重新执行 `pnpm build`——dsh 启动时不会自动重建。
+
+### 通用说明
 
 该包声明了 `dsh.bundle` 补丁（`cordis.patch.yml`），因此 profile 的 layer 栈会
 自动拾取 `codearts-auth` 行。插件注入由 dsh base 提供的 `credentials`、
@@ -102,25 +126,8 @@ Tokens 福利）。
 
 ### 安装到 profile 之前先构建
 
-`dsh plugin` 会把本地检出安装为 pnpm `link:` 依赖——即指向本目录的符号链接——
-而 pnpm 从不为 `link:` 依赖运行构建脚本（`prepare` 脚本只在打包发布或
-registry/git 安装时执行）。包的入口是编译产物 `lib/index.js`（已被 gitignore，
-由 `pnpm build` 生成），因此未构建的检出会在 dsh 启动时报
-`ERR_MODULE_NOT_FOUND: ... dsh-codearts-auth/lib/index.js`。
-
-用 git URL 安装（见「安装」）无需手动构建——pnpm 安装 git 依赖时会自动执行
-`prepare` 脚本完成编译。只有本地 `link:` 安装才需要先构建。
-
-构建后再安装（先构建或后构建均可），然后重新运行 `dsh`——链接会立即看到
-`lib/`：
-
-```sh
-pnpm build                        # 在本仓库中
-dsh plugin --profile <name> install <path-to-this-repo>
-dsh <name>                        # 或：pnpm dsh <name>
-```
-
-每次修改 `src/` 后都需要重新构建——`dsh` 启动时不会自动重建。
+详见「安装」小节。`dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:`
+依赖运行 `prepare` 脚本，因此必须先 `pnpm build` 生成 `lib/`。
 
 ## 工作原理
 
