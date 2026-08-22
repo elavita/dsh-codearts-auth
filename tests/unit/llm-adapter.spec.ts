@@ -545,6 +545,494 @@ describe('CodeArtsAdapter', () => {
     expect(fetchImpl).toHaveBeenCalled()
   })
 
+  it('switches deepseek-v4 to DSML tool mode: no tools field, schema injected into system', async () => {
+    // deepseek-v4 大文件写入修复（实测 2026-08-22）：标准 tool_calls 参数
+    // 一次性打包生成，SSE 静默 >60s 被 APIG 网关掐断且后端不发心跳；
+    // 当工具列表含大参数写文件类工具（write）时改为不发送 tools 字段、
+    // 把 function schema 注入 system 提示，让模型以原生 DSML 流式输出
+    // 工具调用（delta.content 走流式通道，全程有数据）。
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        model?: string
+        tools?: unknown[]
+        messages?: Array<Record<string, unknown>>
+      }
+      expect(sent.model).toBe('deepseek-v4-flash')
+      // deepseek-v4 的 DSML 工具模式下不得发送 tools 字段（发送会触发
+      // 标准 tool_calls 一次性打包路径）。
+      expect(sent.tools).toBeUndefined()
+      const wire = sent.messages ?? []
+      const system = wire.find(message => message.role === 'system') as Record<string, unknown> | undefined
+      // DSML 指令 + 工具 schema 注入 system 消息。
+      expect(system?.content).toContain('DSML')
+      expect(system?.content).toContain('工具名')
+      expect(String(system?.content)).toContain('write')
+      expect(String(system?.content)).toContain('Write content to a file')
+      // harness 原始 user 消息保留在 system 之后。
+      expect(wire.some(message => message.role === 'user')).toBe(true)
+      // 模型以 DSML 格式输出工具调用，适配器解析为结构化 tool-call。
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="write">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="content" string="true">export const x = 1;</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    let finishKind: string | undefined
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'write a file' }],
+      tools: [{
+        name: 'write',
+        description: 'Write content to a file at the given path.',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', description: 'Absolute file path' },
+            content: { type: 'string', description: 'File content' },
+          },
+          required: ['filePath', 'content'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('write')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ filePath: '/tmp/a.ts', content: 'export const x = 1;' })
+    expect(finishKind).toBe('tool-calls')
+  })
+
+  it('mints a unique callId for DSML tool calls so harness pairing and web UI work', async () => {
+    // DSML 语法没有 provider 签发的 call id。空 id 会让同一响应的多个
+    // 工具调用（tool/call ↔ tool/result 配对、web UI 工具行 key）冲突，
+    // UI 只能回退为泛化的 "Tool call" 而丢失 read/write 专属控件。
+    // 适配器必须为每个 DSML 调用生成非空且互不相同的 callId。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls>'
+        + '<｜DSML｜invoke name="read"><｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter></｜DSML｜invoke>'
+        + '<｜DSML｜invoke name="write"><｜DSML｜parameter name="filePath" string="true">/tmp/b.ts</｜DSML｜parameter><｜DSML｜parameter name="content" string="true">x</｜DSML｜parameter></｜DSML｜invoke>'
+        + '</｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const deltas: Array<{ id: string; name?: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'do both' }],
+      tools: [
+        { name: 'read', description: 'Read', parameters: { type: 'object', properties: { filePath: { type: 'string' } } } },
+        { name: 'write', description: 'Write', parameters: { type: 'object', properties: { filePath: { type: 'string' }, content: { type: 'string' } } } },
+      ],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'tool-call-delta') {
+        deltas.push({ id: String(chunk.id), ...chunk.name !== undefined ? { name: chunk.name } : {} })
+      }
+    }
+    expect(deltas).toHaveLength(2)
+    // 两个 DSML 调用的 callId 非空且互不相同。
+    expect(deltas[0].id).not.toBe('')
+    expect(deltas[1].id).not.toBe('')
+    expect(deltas[0].id).not.toBe(deltas[1].id)
+    expect(deltas.map(d => d.name)).toEqual(['read', 'write'])
+  })
+
+  it('parses DSML tool calls embedded in reasoning_content (deepseek-v4 quirk)', async () => {
+    // 实测 2026-08-22：deepseek-v4-flash 有时把完整回答（含 DSML 块）输出在
+    // reasoning_content 而 content 为空。旧实现把 reasoning_content 直接追加
+    // 到 reasoning 块、从不走 DSML 提取器，导致 DSML 块被当推理文本吞掉
+    // （任务 completed 但工具未执行，text 与 reasoning 内容重复）。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="write">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="content" string="true">export const x = 1;</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+      // 模型把正文+DSML 全放在 reasoning_content。
+      const reasoning = '用户要求写入文件，我需要调用 write 工具。\n' + dsml
+      return new Response(
+        `data: {"choices":[{"delta":{"reasoning_content":${JSON.stringify(reasoning)}}}]}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const textDeltas: string[] = []
+    let finishKind: string | undefined
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'write a file' }],
+      tools: [{
+        name: 'write',
+        description: 'Write content to a file at the given path.',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', description: 'Absolute file path' },
+            content: { type: 'string', description: 'File content' },
+          },
+          required: ['filePath', 'content'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('write')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ filePath: '/tmp/a.ts', content: 'export const x = 1;' })
+    expect(finishKind).toBe('tool-calls')
+    // reasoning_content 中的 DSML 已解析为工具调用，不再泄漏到正文。
+    expect(textDeltas.join('')).not.toContain('DSML')
+    expect(textDeltas.join('')).not.toContain('<｜DSML｜')
+  })
+
+  it('routes reasoning_content thinking into the reasoning block, never the text body', async () => {
+    // 实测 2026-08-22：deepseek-v4-flash 的 reasoning_content 通常没有
+    // <thought> 标签（如 "The user wants me to:..."）。旧实现把提取器返回
+    // 的 `text`（开标签前思考）发给正文块，导致思考泄漏到 TUI 正文
+    // （The user wants me to... 跑到正文、没有 Think）。修复后
+    // reasoning_content 的 text+reasoning 必须全部进入 reasoning 块。
+    const fetchImpl = vi.fn(async () => {
+      // 模型把思考（无 <thought> 标签）+ DSML 工具调用全放 reasoning_content。
+      const reasoning = 'The user wants me to read the file and write it.\nLet me do that step by step.'
+        + '<｜DSML｜tool_calls><｜DSML｜invoke name="read"><｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"reasoning_content":${JSON.stringify(reasoning)}}}]}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    const toolCallBlocks: Array<{ name: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read and write a file' }],
+      tools: [
+        { name: 'read', description: 'Read', parameters: { type: 'object', properties: { filePath: { type: 'string' } } } },
+        { name: 'write', description: 'Write', parameters: { type: 'object', properties: { filePath: { type: 'string' }, content: { type: 'string' } } } },
+      ],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name })
+      }
+    }
+    // 思考进入 Think 区域。
+    const reasoningText = reasoningDeltas.join('')
+    expect(reasoningText).toContain('The user wants me to read the file')
+    expect(reasoningText).toContain('Let me do that step by step.')
+    // 正文不泄漏思考。
+    expect(textDeltas.join('')).not.toContain('The user wants me')
+    // DSML 工具调用正常解析。
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('read')
+  })
+
+  it('parses DSML in reasoning_content even when content channel has an unclosed <thought> (independent extractors)', async () => {
+    // 回归 session-067dcf78 turn1 step13 / turn2 step3：deepseek-v4 在
+    // content 通道输出 <thought> 开标签（提取器进入 in-thought 状态）后，
+    // 把推理与完整 DSML 工具调用写到 reasoning_content 通道。旧实现共用
+    // 单个 DSML 提取器，content 的 <thought> 污染提取器状态为 in-thought，
+    // reasoning_content 的 DSML 块被当作 thought 内容吞掉、不解析为
+    // tool-call，残留 DSML 标签经 visible 回退泄漏到正文 text 块
+    // （reasoning 与 text 内容完全相同、均含 <｜DSML｜...>，任务中断）。
+    // 修复后 content 与 reasoning_content 使用独立提取器，互不污染。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls>'
+        + '<｜DSML｜invoke name="read"><｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter></｜DSML｜invoke>'
+        + '</｜DSML｜tool_calls>'
+      // content 通道：<thought> 开标签 + 思考片段，无闭标签（提取器进入 in-thought）。
+      const content = '<thought>用户要求读取文件，我需要调用 read 工具。'
+      // reasoning_content 通道：推理 + 完整 DSML 块。
+      const reasoning = '让我先读取文件内容。\n' + dsml
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(content)},"reasoning_content":${JSON.stringify(reasoning)}}}]}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const textDeltas: string[] = []
+    let finishKind: string | undefined
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read a file' }],
+      tools: [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: { filePath: { type: 'string' } } } }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    // reasoning_content 的 DSML 块被独立提取器解析为 tool-call。
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('read')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ filePath: '/tmp/a.ts' })
+    expect(finishKind).toBe('tool-calls')
+    // DSML 标签不泄漏到正文。
+    expect(textDeltas.join('')).not.toContain('DSML')
+    expect(textDeltas.join('')).not.toContain('<｜DSML｜')
+  })
+
+  it('does not leak DSML tags from reasoning to text via visible fallback (reasoning references DSML syntax)', async () => {
+    // 回归 session-a69fa289 turn2 step26：deepseek-v4 在推理中引用 DSML 语法
+    // （仅含闭合标签片段，非完整工具调用块），提取器正确不解析（无开标签），
+    // 整段作为 reasoning。但 visible 回退把含 DSML 标签的推理复制到正文，
+    // 导致 DSML 标签泄漏到正文、任务终止。修复后 visible 回退检查推理是否
+    // 含 DSML 标签，含则不复制为正文（推理仍在 Think 区域可见）。
+    const fetchImpl = vi.fn(async () => {
+      const reasoning = 'Let me read protocol/mod.rs to see the current SseTimeoutConfig.\n'
+        + '</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"reasoning_content":${JSON.stringify(reasoning)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    let finishKind: string | undefined
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'continue' }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    // 推理在 Think 区域可见。
+    expect(reasoningDeltas.join('')).toContain('SseTimeoutConfig')
+    // DSML 标签不泄漏到正文（visible 回退不复制含 DSML 标签的推理）。
+    expect(textDeltas.join('')).toBe('')
+    expect(finishKind).toBe('stop')
+  })
+
+  it('coerces numeric-looking DSML string params (offset="1304") to number', async () => {
+    // 实测 2026-08-22：deepseek-v4 对 read 的 offset 误标 string="true"，
+    // 输出 offset="1304"。旧实现保持字符串，工具 schema 校验报
+    // `"offset" must be a number`。修复后数字字面量字符串按原始类型解析。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="read">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/big.ts</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="offset" string="true">1304</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="limit" string="true">2000</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read big file' }],
+      tools: [{
+        name: 'read',
+        description: 'Read a file',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string' },
+            offset: { type: 'number' },
+            limit: { type: 'number' },
+          },
+          required: ['filePath'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    const args = JSON.parse(toolCallBlocks[0].arguments) as { filePath: string; offset: number; limit: number }
+    expect(args.filePath).toBe('/tmp/big.ts')
+    // 数字字符串参数被转换为 number。
+    expect(args.offset).toBe(1304)
+    expect(typeof args.offset).toBe('number')
+    expect(args.limit).toBe(2000)
+    expect(typeof args.limit).toBe('number')
+  })
+
+  it('coerces array-looking DSML string params (todos string="true") to array', async () => {
+    // 实测 session-59e52486 turn1 step3：deepseek-v4 对 todo_write 的 todos
+    // 数组参数误标 string="true"，把 JSON 编码的数组当作字符串输出。旧实现
+    // tryParseScalar 只解析 number/boolean/null 标量，不解析 JSON 数组，
+    // todos 保持字符串，工具 schema 校验报 `"todos" must be an array`。
+    // 修复后 tryParseScalar 对 [ / { 开头的合法 JSON 还原为原始类型。
+    const todosJson = JSON.stringify([
+      { content: '了解项目结构', status: 'in_progress' },
+      { content: '实现 atomcode provider', status: 'pending' },
+    ])
+    const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="todo_write">'
+      + `<｜DSML｜parameter name="todos" string="true">${todosJson}</｜DSML｜parameter>`
+      + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'plan the work' }],
+      tools: [{
+        name: 'todo_write',
+        description: 'Write a todo list',
+        parameters: {
+          type: 'object',
+          properties: {
+            todos: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  content: { type: 'string' },
+                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                },
+              },
+            },
+          },
+          required: ['todos'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    const args = JSON.parse(toolCallBlocks[0].arguments) as { todos: unknown }
+    // todos 被还原为数组，而非保持字符串。
+    expect(Array.isArray(args.todos)).toBe(true)
+    expect(args.todos).toEqual([
+      { content: '了解项目结构', status: 'in_progress' },
+      { content: '实现 atomcode provider', status: 'pending' },
+    ])
+  })
+
+  it('forwards GenerateOptions.system as a system message (session title fix)', async () => {
+    // 标题生成等辅助请求通过 GenerateOptions.system 传入系统提示。旧实现
+    // 丢弃了 options.system，模型只看到 user prompt 本身，于是把
+    // "Generate the session title from this JSON array..." 回显成标题
+    // （实测 2026-08-22：session 标题显示为 prompt 文本）。
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<{ role: string; content: string }>
+      }
+      const systems = (sent.messages ?? []).filter(m => m.role === 'system')
+      expect(systems).toHaveLength(1)
+      expect(systems[0].content).toContain('Create a concise title')
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"Fix DSML parsing"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const texts: string[] = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'Generate the session title from this JSON array of human messages:\n[...]' }],
+      system: 'Create a concise title for an AI coding-assistant session from the supplied human messages.\nReturn only the title on one line.',
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+    expect(texts.join('')).toBe('Fix DSML parsing')
+  })
+
+  it('keeps deepseek-v4 on standard tool_calls mode when tools are small-parameter only (read/bash)', async () => {
+    // 纯 read/bash 等小参数工具不应触发 DSML 工具模式（实测单次 read 两种
+    // 模式耗时几乎相同，但 DSML 会让模型 reasoning 略长、finish_reason
+    // 变为 stop，且要求模型先理解 DSML 语法——不值得付出这些代价）。
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        model?: string
+        tools?: unknown[]
+        messages?: Array<Record<string, unknown>>
+      }
+      expect(sent.model).toBe('deepseek-v4-flash')
+      // 保持标准 tools 字段，且不注入 DSML system 提示。
+      expect(sent.tools).toBeDefined()
+      expect(sent.tools).toHaveLength(1)
+      const wire = sent.messages ?? []
+      expect(wire.some(message => message.role === 'system')).toBe(false)
+      // 模型以标准 tool_calls 输出，适配器照常解析。
+      return new Response(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a.ts\\"}"}}]}}]}\n\n'
+        + 'data: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read a file' }],
+      tools: [{
+        name: 'read',
+        description: 'Read a file',
+        parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('read')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ filePath: '/tmp/a.ts' })
+  })
+
   it('replays assistant tool_calls and tool results back to the model', async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const sent = JSON.parse(String(init?.body ?? '{}')) as {
@@ -617,5 +1105,303 @@ describe('CodeArtsAdapter', () => {
     } as never
     for await (const _ of adapter.stream(opts)) { /* drain */ }
     expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  it('classifies an SSE transport "terminated" error as retryable TRANSPORT, not UNKNOWN', async () => {
+    // CodeArts 网关在 SSE 空闲 ~60s 后掐断连接，Node undici reader.read() 抛
+    // TypeError: terminated。该错误非 HarnessError，会被归为 UNKNOWN（不可重试）
+    // 导致 harness 直接失败。适配器须把它映射为可重试的 TRANSPORT。
+    let pullCalls = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        // 第一次 pull：发送一个 chunk；第二次 pull（数据已被消费后）让流
+        // error 模拟对端掐断。用计数器确保先消费再 error。
+        pullCalls++
+        if (pullCalls === 1) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+        } else {
+          controller.error(new TypeError('terminated'))
+        }
+      },
+    })
+    const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const adapter = makeAdapter({ fetchImpl })
+    const chunks: string[] = []
+    let caught: LlmError | undefined
+    try {
+      for await (const chunk of adapter.stream(streamOptions)) {
+        if (chunk.type === 'text-delta') chunks.push(chunk.text)
+      }
+    } catch (error) {
+      if (error instanceof LlmError) caught = error
+    }
+    expect(chunks).toEqual(['hi'])
+    expect(caught?.code).toBe('TRANSPORT')
+  })
+
+  it('reports a retryable TIMEOUT when the SSE stream goes idle beyond the chunk threshold', async () => {
+    // 模型生成长推理时两次 chunk 间静默超过 chunk 超时窗口：适配器应主动以
+    // 可重试 TIMEOUT 失败（而非被动等网关掐断后变成 UNKNOWN）。
+    // 用短超时环境变量避免真实等待 600s。
+    const prev = process.env.DSH_CODEARTS_SSE_CHUNK_TIMEOUT_MS
+    process.env.DSH_CODEARTS_SSE_CHUNK_TIMEOUT_MS = '200'
+    try {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+          // 永不发送更多数据——触发空闲超时
+        },
+      })
+      const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      const adapter = makeAdapter({ fetchImpl })
+      const chunks: string[] = []
+      let caught: LlmError | undefined
+      try {
+        for await (const chunk of adapter.stream(streamOptions)) {
+          if (chunk.type === 'text-delta') chunks.push(chunk.text)
+        }
+      } catch (error) {
+        if (error instanceof LlmError) caught = error
+      }
+      expect(chunks).toEqual(['hi'])
+      expect(caught?.code).toBe('TIMEOUT')
+      expect(caught?.message).toContain('chunk timeout')
+    } finally {
+      if (prev === undefined) delete process.env.DSH_CODEARTS_SSE_CHUNK_TIMEOUT_MS
+      else process.env.DSH_CODEARTS_SSE_CHUNK_TIMEOUT_MS = prev
+    }
+  }, 10_000)
+
+  it('reports a retryable TIMEOUT when no first token arrives in time', async () => {
+    // 首 token 超时：连接建立后模型长时间不输出任何数据（如排队中、
+    // 模型冷启动）。适配器应以可重试 TIMEOUT 失败，phase=first-token。
+    const prev = process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS
+    process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS = '200'
+    try {
+      const body = new ReadableStream<Uint8Array>({
+        start() {
+          // 永不 enqueue 任何数据——触发首 token 超时
+        },
+      })
+      const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      const adapter = makeAdapter({ fetchImpl })
+      let caught: LlmError | undefined
+      try {
+        for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+      } catch (error) {
+        if (error instanceof LlmError) caught = error
+      }
+      expect(caught?.code).toBe('TIMEOUT')
+      expect(caught?.message).toContain('first-token timeout')
+    } finally {
+      if (prev === undefined) delete process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS
+      else process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS = prev
+    }
+  }, 10_000)
+
+  it('extracts DSML tool_calls embedded in delta.content into structured tool-call blocks', async () => {
+    // 某些模型（如 deepseek-v4）在工具模式不匹配时会把工具调用以原生
+    // DSML XML 风格直接写入 delta.content，适配器须识别并解析为结构化
+    // tool-call，避免原始 <｜DSML｜...> token 泄漏到 web UI。
+    const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="bash">'
+      + '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
+      + '<｜DSML｜parameter name="description" string="true">list files</｜DSML｜parameter>'
+      + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    let finishKind: string | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    // DSML 内容不应作为文本泄漏
+    expect(textDeltas.join('')).toBe('')
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('bash')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ command: 'ls', description: 'list files' })
+    expect(finishKind).toBe('tool-calls')
+  })
+
+  it('extracts DSML tool_calls streamed across multiple chunks', async () => {
+    // DSML 块可能跨多个 SSE chunk 分片到达，提取器须缓冲未完成部分
+    // 直到闭标签到达才解析，期间不产出任何文本。
+    const parts = [
+      '<｜DSML｜tool_calls><｜DSML｜invoke name="pwsh">',
+      '<｜DSML｜parameter name="command" string="true">ls "D:\\jet"',
+      '</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
+    ]
+    const sse = parts.map(p => `data: {"choices":[{"delta":{"content":${JSON.stringify(p)}}}]}\n\n`).join('')
+      + 'data: [DONE]\n\n'
+    const fetchImpl = vi.fn(async () => new Response(
+      sse,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(textDeltas.join('')).toBe('')
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('pwsh')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ command: 'ls "D:\\jet"' })
+  })
+
+  it('passes through plain text alongside DSML tool_calls', async () => {
+    // 模型可能在同一段输出中先写普通文本再写 DSML 工具调用，
+    // 提取器须放行文本部分并解析 DSML 部分。
+    const text = '查看providers目录\n'
+    const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="bash">'
+      + '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
+      + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(text + dsml)}}}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(textDeltas.join('')).toBe(text)
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('bash')
+  })
+
+  it('flushes incomplete DSML as text when the stream ends without a closing tag', async () => {
+    // 若模型输出被 max_tokens 截断，DSML 块可能不完整（无闭标签）。
+    // 提取器 flush() 须把残留作为纯文本放行，避免吞掉内容；同时
+    // finish_reason='length' 路径触发 harness max-tokens 续写。
+    const incomplete = '<｜DSML｜tool_calls><｜DSML｜invoke name="bash">'
+      + '<｜DSML｜parameter name="command" string="true">ls'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(incomplete)}},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    let finishKind: string | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    // 不完整 DSML 作为文本放行（用户可见），finish 报 max-tokens 触发续写
+    expect(textDeltas.join('')).toBe(incomplete)
+    expect(finishKind).toBe('max-tokens')
+  })
+
+  it('extracts <thought> blocks as reasoning instead of leaking to visible text', async () => {
+    // DeepSeek-V4 Thinking 模式：模型把推理过程包裹在 <thought>...</thought>
+    // 中写入 delta.content。适配器须把 <thought> 内容作为 reasoning-delta
+    // 输出（显示在 Think 区域），而非作为 text-delta 泄漏到正文。
+    const thought = '<thought>我需要先查看目录结构，再决定如何操作。</thought>'
+    const visible = '查看完成，开始操作。'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(thought + visible)}}}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+    }
+    // <thought> 内容作为 reasoning 输出，不泄漏到正文
+    expect(textDeltas.join('')).toBe(visible)
+    expect(reasoningDeltas.join('')).toBe('我需要先查看目录结构，再决定如何操作。')
+  })
+
+  it('streams <thought> reasoning incrementally across multiple chunks', async () => {
+    // <thought> 块跨多个 SSE chunk 分片到达，提取器须流式输出 reasoning
+    // 增量（与 delta.reasoning_content 行为一致），不等到块结束才输出。
+    const parts = [
+      '<thought>第一步：分析需求',
+      '。第二步：制定计划。',
+      '</thought>开始执行。',
+    ]
+    const sse = parts.map(p => `data: {"choices":[{"delta":{"content":${JSON.stringify(p)}}}]}\n\n`).join('')
+      + 'data: [DONE]\n\n'
+    const fetchImpl = vi.fn(async () => new Response(
+      sse,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+    }
+    expect(textDeltas.join('')).toBe('开始执行。')
+    expect(reasoningDeltas.join('')).toBe('第一步：分析需求。第二步：制定计划。')
+  })
+
+  it('handles <thought> followed by DSML tool_calls in the same content stream', async () => {
+    // Thinking 模式 + 工具调用：模型先输出 <thought> 推理，再输出
+    // DSML tool_calls。适配器须分别路由到 reasoning 和 tool-call 块。
+    const thought = '<thought>需要列出目录内容。</thought>'
+    const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="bash">'
+      + '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
+      + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(thought + dsml)}}}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    let finishKind: string | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+      if (chunk.type === 'finish') finishKind = chunk.reason.kind
+    }
+    expect(textDeltas.join('')).toBe('')
+    expect(reasoningDeltas.join('')).toBe('需要列出目录内容。')
+    expect(toolCallBlocks).toHaveLength(1)
+    expect(toolCallBlocks[0].name).toBe('bash')
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ command: 'ls' })
+    expect(finishKind).toBe('tool-calls')
+  })
+
+  it('flushes incomplete <thought> as reasoning when the stream ends without closing tag', async () => {
+    // 不完整的 <thought> 块（被 max_tokens 截断）：flush() 须把残留
+    // 作为 reasoning 放行，避免推理泄漏到正文。
+    const incompleteThought = '<thought>我正在思考'
+    const fetchImpl = vi.fn(async () => new Response(
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(incompleteThought)}},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const textDeltas: string[] = []
+    const reasoningDeltas: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') textDeltas.push(chunk.text)
+      if (chunk.type === 'reasoning-delta') reasoningDeltas.push(chunk.text)
+    }
+    // 不完整 thought 作为 reasoning 放行，不泄漏到正文
+    expect(textDeltas.join('')).toBe('')
+    expect(reasoningDeltas.join('')).toBe('我正在思考')
   })
 })

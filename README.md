@@ -8,9 +8,21 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 ## 安装
 
+该包尚未发布到 npm registry，请用 **git URL** 安装。`dsh plugin` 会把参数转发给
+pnpm（见 `@deepseek-ai/dsh` 的 `README.zh.md`），pnpm 支持 git 依赖，并在 git
+安装时自动执行 `prepare` 脚本（即 `pnpm build`）构建 `lib/`：
+
 ```sh
-dsh plugin add dsh-codearts-auth
+dsh plugin --profile <name> add git+ssh://git@gitee.com/iJetLi/deepseek-harness-codearts.git
 ```
+
+指定分支或 tag 安装（默认 `#HEAD`，本仓库分支为 `master`）：
+
+```sh
+dsh plugin --profile <name> add git+ssh://git@gitee.com/iJetLi/deepseek-harness-codearts.git#master
+```
+
+> 安装前请确保远端已推送最新提交（含大文件写入修复）。
 
 该包声明了 `dsh.bundle` 补丁（`cordis.patch.yml`），因此 profile 的 layer 栈会
 自动拾取 `codearts-auth` 行。插件注入由 dsh base 提供的 `credentials`、
@@ -95,6 +107,9 @@ Tokens 福利）。
 registry/git 安装时执行）。包的入口是编译产物 `lib/index.js`（已被 gitignore，
 由 `pnpm build` 生成），因此未构建的检出会在 dsh 启动时报
 `ERR_MODULE_NOT_FOUND: ... dsh-codearts-auth/lib/index.js`。
+
+用 git URL 安装（见「安装」）无需手动构建——pnpm 安装 git 依赖时会自动执行
+`prepare` 脚本完成编译。只有本地 `link:` 安装才需要先构建。
 
 构建后再安装（先构建或后构建均可），然后重新运行 `dsh`——链接会立即看到
 `lib/`：

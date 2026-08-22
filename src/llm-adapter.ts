@@ -108,7 +108,10 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
     const content = Array.isArray(message.content) ? message.content : []
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
-    const text = contentToText(content)
+    // 纯文本 user 消息（字符串 content）需原样传递：contentToText 处理
+    // 字符串时直接返回，但这里不能用 `content`（非数组时为 []）——否则
+    // 字符串 user 消息会被序列化成空串，模型看不到任务指令。
+    const text = contentToText(message.content)
     if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
     for (const result of toolResults) {
       wire.push({
@@ -119,6 +122,75 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
     }
   }
   return wire
+}
+
+/**
+ * 判断模型是否为 deepseek-v4 系列（flash/pro）。
+ *
+ * deepseek-v4 对标准 OpenAI 格式的 `tool_calls.arguments` 采用一次性打包
+ * 生成：模型在生成超大工具参数（如 2000 行 write content）期间 SSE 流
+ * 长时间无数据，APIG 网关 ~60s 空闲超时必然掐断连接（`terminated`），
+ * 且后端不会对任何请求头发送心跳保活（实测 2026-08-22：无论是否携带
+ * app-id/plugin-name/x-ot-* 等 IDE 头、是否带 `accept: text/event-stream`、
+ * `tool_stream`、调整 `max_tokens`，SSE 流均无 `:` 注释行，60s 静默必断）。
+ *
+ * 但 deepseek-v4 原生支持 DSML 工具调用格式：工具调用直接写入
+ * `delta.content`（形如 `<｜DSML｜tool_calls>...`），走与 reasoning 相同的
+ * 流式通道。实测（2026-08-22 e2e 探测）：1000 行 write content 的 DSML
+ * 流全程最大静默仅 204ms，146s 完整结束；标准 tool_calls 模式 100 行也
+ * 会在 17.7s 静默后一次性到达、300 行即 60s 断连。因此对 deepseek-v4
+ * 模型将工具 schema 注入 system 消息、请求体不发送 `tools` 字段，让模型
+ * 以 DSML 流式输出工具调用，从根上规避网关空闲断连。
+ */
+function isDeepseekV4Model(model: string): boolean {
+  return /^deepseek-v4-(flash|pro)$/.test(model)
+}
+
+/**
+ * 工具名匹配大参数写文件类工具（content/arguments 可能达到数万 token）。
+ * 只有这类工具触发 deepseek-v4 的 DSML 工具模式；read/bash/glob 等小参数
+ * 工具继续走标准 `tool_calls`（实测单次 read 两种模式耗时几乎相同，但
+ * DSML 会让模型 reasoning 略长、`finish_reason` 变为 `stop`，且要求模型
+ * 先理解 DSML 语法——对不需要大参数的工具不值得付出这些代价）。
+ */
+const DSML_LARGE_PARAM_TOOLS = ['write', 'file_write', 'apply_patch']
+function needsDsmlToolMode(model: string, toolNames: readonly string[]): boolean {
+  if (!isDeepseekV4Model(model)) return false
+  return toolNames.some(name => DSML_LARGE_PARAM_TOOLS.includes(name))
+}
+
+/**
+ * 构造让 deepseek-v4 以原生 DSML 格式调用工具的 system 提示。
+ *
+ * 适配器不把 `tools` 字段发给后端（否则模型走标准 tool_calls 一次性
+ * 打包路径），而是把 OpenAI function schema 以文本注入 system 消息，
+ * 并明确要求模型使用 `<｜DSML｜tool_calls>` 语法。`parseDsmlToolCalls`
+ * 会把模型输出的 DSML 块解析为结构化 tool-call，harness 无需感知差异。
+ */
+function buildDsmlSystemPrompt(tools: Array<{
+  type: string
+  function: { name: string; description?: string; parameters?: unknown }
+}>): string {
+  const toolJson = JSON.stringify(tools.map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+  })), null, 2)
+  return [
+    '以下是你可用的工具及其 JSON Schema。当需要调用工具完成任务时，',
+    '必须使用原生 DSML 工具调用语法输出，格式如下：',
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="工具名"><｜DSML｜parameter name="参数名" string="true">参数值</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
+    '',
+    '规则：',
+    '- 工具名必须是下面列表中的 name。',
+    '- 每个参数用一个 <｜DSML｜parameter> 标签包裹，参数值放在标签之间。',
+    '- 字符串参数加 string="true" 属性；对象/数组/数字/布尔参数不要加该属性。',
+    '- 一次可以输出多个 <｜DSML｜invoke> 调用（工具可以并行）。',
+    '- 文件内容请一次性完整写入单个 write 调用的 content 参数，不要拆分或省略。',
+    '',
+    '工具列表（JSON Schema）：',
+    toolJson,
+  ].join('\n')
 }
 
 /**
@@ -133,6 +205,58 @@ export const QUEUE_STATUS_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.c
 const QUEUE_RETRY_DELAY_MS = 10_000
 /** 轮询上限：180 × 10 秒 = 30 分钟，与 deveco-code 参考实现一致。 */
 const QUEUE_MAX_ATTEMPTS = 180
+
+/**
+ * SSE 流空闲超时。CodeArts 后端 / APIG 网关对 SSE 连接有 ~60 秒无数据即
+ * 断开的策略：当模型生成超长推理或大工具调用参数时，两次 chunk 之间可能
+ * 静默数十秒，连接被服务端掐断后 Node undici 的 reader.read() 抛
+ * `TypeError: terminated`。该错误非 HarnessError，被 normalizeLlmFailure
+ * 归类为 UNKNOWN（不可重试），harness 直接失败。
+ * 主动以略小于网关超时的窗口检测空闲：超时则取消 reader 并抛可重试的
+ * TIMEOUT，让 harness 重试该步骤（历史已持久化，重试会带相同上下文）。
+ *
+ * SSE 流超时配置（对齐 CodeArts Agent IDE agentkernelServer 逆向实证：
+ * `firstTokenTimeout = 300000` / `chunkTimeout = 600000`）。
+ *
+ * 历史背景：原实现用单一 `SSE_IDLE_TIMEOUT_MS = 55_000`（55s），对齐
+ * APIG 网关 ~60s 空闲断连。但 deepseek-v4-flash 生成大文件 write 工具
+ * 调用的 content 参数时，会先输出 file_path 参数然后长时间静默（模型
+ * 在内部做长文本生成但不在 SSE 上 flush），实测三次均在 ~55s 处被掐断、
+ * 重试后又重复相同模式——55s 对这类"思考型长生成"太短。
+ *
+ * IDE 的方案是拆成两个超时：
+ * - firstTokenTimeout=300s：等第一个 token 的窗口，到点才报错
+ * - chunkTimeout=600s：每收到一个 chunk 就重置；两次 chunk 之间超过 10 分钟才报错
+ *
+ * 两者均可通过环境变量覆盖（毫秒，整数），便于测试用短超时触发 TIMEOUT
+ * 路径，或在线上针对特定模型调优。环境变量在每次 stream() 调用时读取，
+ * 避免模块顶层常量在 import 时定型、测试运行中设置环境变量不生效。
+ */
+function resolveFirstTokenTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS ?? '', 10) || 300_000
+}
+function resolveChunkTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_CODEARTS_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 600_000
+}
+
+/**
+ * 判断一个错误是否为 SSE 传输级故障（连接被对端掐断 / socket 重置 /
+ * undici 内部 socket 错误），而非业务错误。这类错误可安全重试整个
+ * chat 请求，因此映射为可重试的 TRANSPORT code，而非 UNKNOWN。
+ */
+function isTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message.toLowerCase()
+  // undici / Node 流在连接被对端关闭时抛 "terminated"
+  if (message.includes('terminated')) return true
+  // undici socket 错误（UND_ERR_SOCKET / UND_ERR_HEADERS_TIMEOUT 等）
+  if (error.name.startsWith('UND_ERR_')) return true
+  // fetch 网络层失败
+  if (message.includes('fetch failed')) return true
+  // TCP 重置 / 对端中断
+  if (message.includes('econnreset') || message.includes('epipe') || message.includes('socket hang up')) return true
+  return false
+}
 
 /**
  * SSE 流内可重试的排队/限流错误信号。CodeArts 后端有时以 HTTP 200 +
@@ -244,6 +368,325 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+/** 安全读取 Error.message，避免访问器抛异常。 */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try { return String(error) } catch { return 'unknown error' }
+}
+
+/**
+ * 在空闲超时内读取一个流块。超过 {@link timeoutMs} 无数据则取消
+ * reader 并抛可重试的 `LlmError('TIMEOUT')`——比被动等待网关掐断更早
+ * 失败，且归类为可重试 code。尊重用户传入的 {@link signal}：若已 abort
+ * 则直接抛 abort 原因，不误报超时。
+ *
+ * {@link phase} 仅用于错误消息区分首 token 超时与 chunk 间超时。
+ */
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  phase: 'first-token' | 'chunk' = 'chunk',
+): Promise<{ done: boolean; value: Uint8Array | undefined }> {
+  if (signal?.aborted) throw signal.reason ?? new Error('aborted')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const onUserAbort = (): void => { if (timer) clearTimeout(timer) }
+  signal?.addEventListener('abort', onUserAbort, { once: true })
+  const readPromise = reader.read()
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { reject(new LlmError(`codearts: sse ${phase} timeout after ${timeoutMs}ms`, 'TIMEOUT')) }, timeoutMs)
+  })
+  try {
+    const result = await Promise.race([readPromise, timeoutPromise])
+    return { done: result.done, value: result.value }
+  } catch (error) {
+    // 用户取消：透传
+    if (signal?.aborted) throw signal.reason ?? error
+    // 空闲超时：取消 reader 释放底层连接，再抛可重试 TIMEOUT
+    if (error instanceof LlmError) {
+      await reader.cancel().catch(() => {})
+      throw error
+    }
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+    signal?.removeEventListener('abort', onUserAbort)
+  }
+}
+
+/**
+ * DSML 工具调用格式提取器。
+ *
+ * 某些模型（如 deepseek-v4）在未通过 `tools` 字段告知工具模式、或工具
+ * 模式与模型训练格式不匹配时，会把工具调用以原生 DSML XML 风格直接写入
+ * `delta.content`，形如：
+ *   `<｜DSML｜tool_calls><｜DSML｜invoke name="bash">
+ *    <｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>
+ *    </｜DSML｜invoke></｜DSML｜tool_calls>`
+ * 适配器若原样作为 text-delta 输出，原始 token 会泄漏到 web UI（表现为
+ * "dump 出奇怪的一段内容后终止"）。本提取器以流式状态机从 content 增量
+ * 中识别完整 DSML 块并解析为结构化 tool-call；非 DSML 文本原样放行，
+ * 保持流式输出不阻塞。
+ *
+ * 同时支持 DeepSeek-V4 Thinking 模式：模型在工具调用前会把推理过程包裹
+ * 在 `<thought>...</thought>` 标记中写入 `delta.content`。本提取器把
+ * `<thought>` 内容作为 reasoning 增量流式输出（与 `delta.reasoning_content`
+ * 行为一致，显示在 web 的 Think 区域而非正文），避免推理文本泄漏到用户
+ * 可见区域。参考 DSML 官方介绍：
+ * https://blog.csdn.net/gitblog_00855/article/details/152146045
+ *
+ * 设计要点：
+ * - 增量友好：content 可能跨多个 SSE chunk 分片到达，提取器维护内部
+ *   缓冲区与多模式状态机（normal / in-thought / in-dsml），仅对已完成
+ *   的 DSML 块产出 tool-call；reasoning 增量流式输出；未完成部分保留
+ *   到下次 feed；非 DSML/thought 文本立即 flush，避免延迟。
+ * - 容错：若缓冲区包含开标签前缀但长时间未闭合，且后续内容不像该标签
+ *   （例如只是普通文本里碰巧出现该前缀），在 flush 时把残留作为纯文本
+ *   输出，避免吞掉用户可见内容。
+ * - 边界：DSML 标签使用全角 `｜`（U+FF5C）而非半角 `|`，与模型实际
+ *   输出一致。`<thought>` 为半角普通 XML 标签，与 DSML 官方文档一致。
+ */
+const DSML_TOOL_CALLS_OPEN = '<｜DSML｜tool_calls>'
+const DSML_TOOL_CALLS_CLOSE = '</｜DSML｜tool_calls>'
+const DSML_INVOKE_OPEN_PREFIX = '<｜DSML｜invoke'
+const DSML_INVOKE_CLOSE = '</｜DSML｜invoke>'
+const DSML_PARAM_OPEN_PREFIX = '<｜DSML｜parameter'
+const DSML_PARAM_CLOSE = '</｜DSML｜parameter>'
+const THOUGHT_OPEN = '<thought>'
+const THOUGHT_CLOSE = '</thought>'
+
+/** 解析单个 DSML invoke 块为 { name, arguments }。 */
+
+/**
+ * 对标记 string="true" 的参数值做宽松解析：若值恰好是 number/boolean
+ * /null 字面量（如 "1304"、"true"、"null"），返回原始类型；若值是合法
+ * JSON 数组或对象（如 todo_write 的 todos 被写成 `[{"content":...}]`），
+ * 还原为原始类型；否则保持字符串。用于纠正模型对数字/数组/对象参数误标
+ * string 的 DSML 输出（如 read 的 offset 被写成 offset="1304"、
+ * todo_write 的 todos 被写成 string="true" 的 JSON 数组字符串），使工具
+ * schema 校验通过。
+ */
+function tryParseScalar(value: string): unknown {
+  if (value === '') return ''
+  const trimmed = value.trim()
+  if (trimmed === '') return value
+  if (trimmed === 'null') return null
+  if (trimmed === 'true') return true
+  if (trimmed === 'false') return false
+  // 整数 / 浮点数 / 负数：仅当整体匹配数字语法时才转换，避免误伤路径
+  // 中的数字片段（如 "v1.2" 不含；"123abc" 不含）。
+  if (/^-?\d+$/.test(trimmed)) return Number(trimmed)
+  if (/^-?\d+\.\d+$/.test(trimmed)) return Number(trimmed)
+  // 数组 / 对象：模型常对数组/对象参数（如 todo_write 的 todos）误标
+  // string="true"，把 JSON 编码的数组/对象当作字符串输出。若值是合法
+  // JSON 数组或对象，还原为原始类型，使工具 schema 校验通过。仅对
+  // `[` / `{` 开头尝试 JSON.parse，避免误伤普通字符串（路径、正文等
+  // 极少以这两个字符开头且整段恰为合法 JSON）。
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try { return JSON.parse(trimmed) } catch { /* 非合法 JSON，保持字符串 */ }
+  }
+  return value
+}
+
+function parseDsmlInvoke(block: string): { name: string; arguments: string } | undefined {
+  // 提取 name="..." 属性
+  const nameMatch = /name\s*=\s*"([^"]*)"/.exec(block)
+  if (nameMatch === null) return undefined
+  const name = nameMatch[1]
+  // 提取所有 parameter 子节点，按出现顺序拼装 arguments JSON
+  const params: Record<string, unknown> = {}
+  let cursor = 0
+  for (;;) {
+    const openStart = block.indexOf(DSML_PARAM_OPEN_PREFIX, cursor)
+    if (openStart === -1) break
+    const openEnd = block.indexOf('>', openStart)
+    if (openEnd === -1) break
+    const openTag = block.slice(openStart, openEnd + 1)
+    const paramNameMatch = /name\s*=\s*"([^"]*)"/.exec(openTag)
+    if (paramNameMatch === null) { cursor = openEnd + 1; continue }
+    const paramName = paramNameMatch[1]
+    const closeStart = block.indexOf(DSML_PARAM_CLOSE, openEnd + 1)
+    if (closeStart === -1) break
+    const value = block.slice(openEnd + 1, closeStart)
+    // string="true" 属性标记字符串类型。但模型经常对数字参数（如 read 的
+    // offset/limit、write 的 offset）误标 string="true"，把 "1304" 当作字符串
+    // 输出，工具 schema 校验报 `"offset" must be a number`。因此即使标记了
+    // string，也尝试 JSON 解析：若是 number/boolean/null 字面量则按原始类型
+    // 使用，其余（路径、正文等）保持字符串。
+    const isString = /string\s*=\s*"true"/.test(openTag)
+    if (isString) {
+      const parsed = tryParseScalar(value)
+      params[paramName] = parsed
+    } else {
+      try { params[paramName] = JSON.parse(value) } catch { params[paramName] = value }
+    }
+    cursor = closeStart + DSML_PARAM_CLOSE.length
+  }
+  return { name, arguments: JSON.stringify(params) }
+}
+
+/**
+ * 从一段已闭合的 DSML tool_calls 块中解析所有 invoke，返回结构化
+ * tool-call 列表。返回 undefined 表示解析失败（调用方应回退为纯文本）。
+ */
+function parseDsmlToolCalls(block: string): Array<{ name: string; arguments: string }> | undefined {
+  // block 形如 `<｜DSML｜tool_calls>...invokes...</｜DSML｜tool_calls>`
+  let inner = block
+  if (inner.startsWith(DSML_TOOL_CALLS_OPEN)) inner = inner.slice(DSML_TOOL_CALLS_OPEN.length)
+  if (inner.endsWith(DSML_TOOL_CALLS_CLOSE)) inner = inner.slice(0, inner.length - DSML_TOOL_CALLS_CLOSE.length)
+  const calls: Array<{ name: string; arguments: string }> = []
+  let cursor = 0
+  for (;;) {
+    const openStart = inner.indexOf(DSML_INVOKE_OPEN_PREFIX, cursor)
+    if (openStart === -1) break
+    const openEnd = inner.indexOf('>', openStart)
+    if (openEnd === -1) break
+    const closeStart = inner.indexOf(DSML_INVOKE_CLOSE, openEnd + 1)
+    if (closeStart === -1) break
+    const invokeBlock = inner.slice(openStart, closeStart + DSML_INVOKE_CLOSE.length)
+    const parsed = parseDsmlInvoke(invokeBlock)
+    if (parsed === undefined) return undefined
+    calls.push(parsed)
+    cursor = closeStart + DSML_INVOKE_CLOSE.length
+  }
+  return calls
+}
+
+/**
+ * 计算缓冲区末尾与任一开标签的最长公共前缀长度。用于流式提取器决定
+ * 保留多少缓冲区等待下次 feed：若末尾是某开标签的不完整前缀（例如
+ * `<tho` 跨 chunk 到达），保留该前缀；否则全部放行，避免短文本被
+ * 过度缓冲延迟输出。
+ */
+function longestOpenPrefixTail(buffer: string, prefixes: readonly string[]): number {
+  let keepLen = 0
+  const maxCheck = Math.min(buffer.length, Math.max(...prefixes.map(p => p.length)))
+  for (let i = 1; i <= maxCheck; i++) {
+    const tail = buffer.slice(buffer.length - i)
+    if (prefixes.some(p => p.startsWith(tail))) keepLen = i
+  }
+  return keepLen
+}
+
+/**
+ * 流式 DSML 提取器。feed() 接收 content delta，返回一个结果对象：
+ * - `text`：应作为 text-delta 输出的纯文本（可能为空串）
+ * - `reasoning`：应作为 reasoning-delta 输出的推理增量（可能为空串）
+ * - `toolCalls`：已完整解析的 DSML tool-call 列表（可能为空数组）
+ * flush() 在流结束时调用，把残留缓冲区作为纯文本返回。
+ *
+ * 状态机三态：
+ * - normal：寻找 `<thought>` 或 `<｜DSML｜tool_calls>` 开标签
+ * - in-thought：寻找 `</thought>` 闭标签，期间内容作为 reasoning 流式输出
+ * - in-dsml：寻找 `</｜DSML｜tool_calls>` 闭标签，完整后解析为 tool-call
+ */
+class DsmlContentExtractor {
+  private buffer = ''
+  private state: 'normal' | 'in-thought' | 'in-dsml' = 'normal'
+
+  feed(chunk: string): { text: string; reasoning: string; toolCalls: Array<{ name: string; arguments: string }> } {
+    let text = ''
+    let reasoning = ''
+    const toolCalls: Array<{ name: string; arguments: string }> = []
+    this.buffer += chunk
+    for (;;) {
+      if (this.state === 'normal') {
+        // 寻找最早出现的开标签（thought 或 DSML tool_calls）
+        const thoughtIdx = this.buffer.indexOf(THOUGHT_OPEN)
+        const dsmlIdx = this.buffer.indexOf(DSML_TOOL_CALLS_OPEN)
+        let openIdx = -1
+        let nextState: 'in-thought' | 'in-dsml' = 'in-thought'
+        if (thoughtIdx !== -1 && (dsmlIdx === -1 || thoughtIdx < dsmlIdx)) {
+          openIdx = thoughtIdx
+          nextState = 'in-thought'
+        } else if (dsmlIdx !== -1) {
+          openIdx = dsmlIdx
+          nextState = 'in-dsml'
+        }
+        if (openIdx === -1) {
+          // 没有完整开标签：但缓冲区末尾可能是任一开标签的不完整前缀
+          const keepLen = longestOpenPrefixTail(this.buffer, [THOUGHT_OPEN, DSML_TOOL_CALLS_OPEN])
+          if (keepLen === 0) {
+            text += this.buffer
+            this.buffer = ''
+          } else if (this.buffer.length > keepLen) {
+            text += this.buffer.slice(0, this.buffer.length - keepLen)
+            this.buffer = this.buffer.slice(this.buffer.length - keepLen)
+          }
+          break
+        }
+        // 放行开标签之前的纯文本
+        if (openIdx > 0) text += this.buffer.slice(0, openIdx)
+        this.buffer = this.buffer.slice(openIdx)
+        // 跳过开标签本身
+        const openLen = nextState === 'in-thought' ? THOUGHT_OPEN.length : DSML_TOOL_CALLS_OPEN.length
+        this.buffer = this.buffer.slice(openLen)
+        this.state = nextState
+        continue
+      }
+      if (this.state === 'in-thought') {
+        // 寻找 </thought> 闭标签，期间内容作为 reasoning 流式输出
+        const closeIdx = this.buffer.indexOf(THOUGHT_CLOSE)
+        if (closeIdx === -1) {
+          // 闭标签未到达：放行除可能的不完整闭标签前缀外的内容
+          const keepLen = longestOpenPrefixTail(this.buffer, [THOUGHT_CLOSE])
+          if (keepLen === 0) {
+            reasoning += this.buffer
+            this.buffer = ''
+          } else if (this.buffer.length > keepLen) {
+            reasoning += this.buffer.slice(0, this.buffer.length - keepLen)
+            this.buffer = this.buffer.slice(this.buffer.length - keepLen)
+          }
+          break
+        }
+        // 放行闭标签之前的推理
+        if (closeIdx > 0) reasoning += this.buffer.slice(0, closeIdx)
+        this.buffer = this.buffer.slice(closeIdx + THOUGHT_CLOSE.length)
+        this.state = 'normal'
+        continue
+      }
+      // state === 'in-dsml'：寻找闭标签，完整块才解析
+      const closeIdx = this.buffer.indexOf(DSML_TOOL_CALLS_CLOSE)
+      if (closeIdx === -1) {
+        // 闭标签未到达，等待更多数据
+        break
+      }
+      const block = this.buffer.slice(0, closeIdx + DSML_TOOL_CALLS_CLOSE.length)
+      const parsed = parseDsmlToolCalls(block)
+      if (parsed === undefined) {
+        // 解析失败：把整个块作为纯文本放行，避免吞内容
+        text += block
+      } else {
+        toolCalls.push(...parsed)
+      }
+      this.buffer = this.buffer.slice(closeIdx + DSML_TOOL_CALLS_CLOSE.length)
+      this.state = 'normal'
+      continue
+    }
+    return { text, reasoning, toolCalls }
+  }
+
+  flush(): { text: string; reasoning: string } {
+    // 流结束：残留缓冲根据状态决定输出通道
+    const remaining = this.buffer
+    this.buffer = ''
+    if (this.state === 'in-thought') {
+      // 不完整的 thought 块：作为 reasoning 放行（避免泄漏到正文）
+      this.state = 'normal'
+      return { text: '', reasoning: remaining }
+    }
+    if (this.state === 'in-dsml') {
+      // 不完整的 DSML 块：开标签已在进入 in-dsml 状态时被消耗，需加回
+      // 才能保持用户可见内容的完整性（避免 dump 出缺少开标签的残片）。
+      this.state = 'normal'
+      return { text: DSML_TOOL_CALLS_OPEN + remaining, reasoning: '' }
+    }
+    // normal 拘留：作为纯文本放行
+    this.state = 'normal'
+    return { text: remaining, reasoning: '' }
+  }
+}
+
 /** 兼容 OpenAI 格式的 CodeArts 模型适配器，使用华为请求签名。 */
 export class CodeArtsAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
@@ -283,6 +726,14 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
 
     const messages = serializeMessages(options.messages)
+    // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
+    // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
+    // messages 数组里的 system 角色，必须显式插入——否则模型看不到
+    // system 指令，只见到 user prompt 本身（实测 2026-08-22：session
+    // 标题变成了 "We need to generate a session title..." 的 prompt 回显）。
+    if (options.system !== undefined && options.system.length > 0) {
+      messages.unshift({ role: 'system', content: options.system })
+    }
     // 将 harness 工具模式以 OpenAI function 格式告知模型，
     // 与 deepseek 适配器序列化 GenerateOptions.tools 的方式一致。
     const tools = options.tools?.map((tool) => ({
@@ -293,6 +744,22 @@ export class CodeArtsAdapter extends LlmAdapter {
         parameters: tool.parameters,
       },
     }))
+    // deepseek-v4 大文件写入修复（详见 isDeepseekV4Model 注释）：标准
+    // tool_calls 参数一次性打包生成，SSE 静默 >60s 被网关掐断。仅当工具
+    // 列表含大参数写文件类工具（write/file_write/apply_patch）时切换到
+    // DSML：不发送 tools 字段、把 schema 注入 system 提示，让模型以
+    // DSML 流式输出工具调用，全程有数据流、不触发网关空闲断连。read/
+    // bash 等小参数工具保持标准 tool_calls，避免 DSML 带来的额外开销。
+    let wireTools = tools
+    if (wireTools !== undefined && needsDsmlToolMode(options.model, wireTools.map(tool => tool.function.name))) {
+      // DSML 工具说明置于 system 之后、user 之前：与 CodeArts Agent IDE
+      // 实际请求体一致（IDE 把工具说明作为 system 消息放在最前）。实证
+      // （2026-08-22）：DSML 提示 push 到 messages 末尾时，deepseek-v4
+      // 倾向把思考写入 content（正文）而非 reasoning_content；unshift 到
+      // user 之前后模型恢复走 reasoning 通道，思考不再泄漏到正文。
+      messages.splice(messages.findIndex(m => m.role === 'system') + 1, 0, { role: 'system', content: buildDsmlSystemPrompt(wireTools) })
+      wireTools = undefined
+    }
     const body = JSON.stringify({
       model: options.model,
       messages,
@@ -300,7 +767,8 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
-      // （error decoding response body）。
+      // （error decoding response body）。deepseek-v4 的 DSML 路径不受此
+      // 影响，保留该字段与 IDE 对齐。
       tool_stream: true,
       // 输出上限（对齐 deveco-code-rust 参考实现 codearts.rs 的 max_tokens 配置）：
       // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
@@ -309,7 +777,7 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
       // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
       max_tokens: options.maxTokens ?? 65536,
-      ...tools !== undefined && tools.length > 0 ? { tools } : {},
+      ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
 
@@ -441,14 +909,109 @@ export class CodeArtsAdapter extends LlmAdapter {
     let buffer = ''
     let streamEnded = false
     let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
+    // DSML 提取器：从 delta.content 中识别模型以原生 DSML XML 风格
+    // 写入的工具调用（deepseek-v4 等模型在工具模式不匹配时会直接
+    // 输出 `<｜DSML｜tool_calls>...`），解析为结构化 tool-call，
+    // 避免原始 token 泄漏到 web UI。
+    // content 与 reasoning_content 两个通道使用各自独立的 DSML 提取器。
+    // 早期实现共用单个提取器，但 deepseek-v4 有时在 content 通道输出
+    // <thought> 开标签（提取器进入 in-thought 状态）后，把后续推理与
+    // DSML 工具调用写到 reasoning_content 通道——共用提取器会把
+    // reasoning_content 的 DSML 块当作 thought 内容吞掉，不解析为
+    // tool-call，最终残留 DSML 标签经 visible 回退泄漏到正文（实测
+    // session-067dcf78 turn1 step13 / turn2 step3）。独立提取器让各
+    // 通道状态机互不污染。
+    const dsmlContentExtractor = new DsmlContentExtractor()
+    const dsmlReasoningExtractor = new DsmlContentExtractor()
+    // 分流 DSML 提取结果：正文文本进入 text 块、thought 进入 reasoning
+    // 块、解析出的工具调用进入 tool-call 块。
+    async function* emitDsmlFeed(
+      text: string,
+      reasoning: string,
+      dsmlCalls: Array<{ name: string; arguments: string }>,
+    ): AsyncIterable<StreamChunk> {
+      if (text.length > 0) {
+        let block = blocks.find(candidate => candidate.kind === 'text')
+        if (block === undefined) {
+          block = { index: nextIndex++, kind: 'text', text: '' }
+          blocks.push(block)
+          yield { type: 'block-start', index: block.index, blockType: 'text' }
+        }
+        block.text += text
+        yield { type: 'text-delta', index: block.index, text }
+      }
+      if (reasoning.length > 0) {
+        let block = blocks.find(candidate => candidate.kind === 'reasoning')
+        if (block === undefined) {
+          block = { index: nextIndex++, kind: 'reasoning', text: '' }
+          blocks.push(block)
+          yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+        }
+        block.text += reasoning
+        yield { type: 'reasoning-delta', index: block.index, text: reasoning }
+      }
+      for (const call of dsmlCalls) {
+        const wireIndex = toolCalls.size
+        // DSML 语法没有 provider 签发的 call id，必须生成唯一 id：
+        // harness 的 tool/call ↔ tool/result 配对与 web UI 的工具行
+        // 渲染都用 callId 作为 key（见 client-runtime 匹配器
+        // `tool/call -> id: String(callId)`），空 id 会让同一响应的
+        // 多个工具调用（或历史重放）配对冲突，UI 只能回退为泛化的
+        // "Tool call" 行而丢失 read/write 专属控件。
+        const block = {
+          index: nextIndex++,
+          text: call.arguments,
+          name: call.name,
+          callId: CallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+        }
+        toolCalls.set(wireIndex, block)
+        toolOrder.push(block.index)
+        yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+        yield {
+          type: 'tool-call-delta',
+          index: block.index,
+          id: block.callId,
+          name: block.name,
+          argumentsDelta: call.arguments,
+        }
+      }
+    }
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
+    // 首 token 与 chunk 间超时分阶段使用（对齐 CodeArts Agent IDE）：
+    // 第一次读取用 firstTokenTimeout（5min），收到首 chunk 后切换为
+    // chunkTimeout（10min），并在每次成功读取后重置。deepseek-v4-flash
+    // 生成大文件 write 的 content 参数时，首 token 后可能长时间静默，
+    // 需要远大于网关 60s 的窗口才不会误判可重试 TIMEOUT 而反复重试。
+    let firstTokenReceived = false
     try {
       for (;;) {
         if (streamEnded) break
-        const { done, value } = await reader.read()
+        // CodeArts 网关对 SSE 有 ~60s 空闲超时：模型生成长推理 / 大工具
+        // 参数时两次 chunk 间可能静默数十秒，连接被对端掐断后 reader.read()
+        // 抛 `TypeError: terminated`（非 HarnessError → UNKNOWN 不可重试 →
+        // harness 直接失败）。以略小于网关超时的窗口主动检测空闲：超时则
+        // 取消 reader 并抛可重试 TIMEOUT；同时把传输级错误映射为可重试
+        // TRANSPORT，让 harness 重试该步骤而非直接失败。
+        let done: boolean
+        let value: Uint8Array | undefined
+        try {
+          const timeoutMs = firstTokenReceived ? resolveChunkTimeoutMs() : resolveFirstTokenTimeoutMs()
+          const phase = firstTokenReceived ? 'chunk' : 'first-token'
+          const result = await readWithIdleTimeout(reader, timeoutMs, options.signal, phase)
+          done = result.done
+          value = result.value
+          if (!done) firstTokenReceived = true
+        } catch (error) {
+          if (options.signal?.aborted) throw error
+          if (error instanceof LlmError) throw error
+          if (isTransportError(error)) {
+            throw new LlmError(`codearts: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error })
+          }
+          throw error
+        }
         if (done) break
-        buffer += decoder.decode(value, { stream: true })
+        buffer += decoder.decode(value!, { stream: true })
         let newline: number
         while ((newline = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newline).trim()
@@ -498,24 +1061,52 @@ export class CodeArtsAdapter extends LlmAdapter {
             finishReason = choice.finish_reason as 'stop' | 'tool_calls' | 'length'
           }
           if (delta?.content) {
-            let block = blocks.find(candidate => candidate.kind === 'text')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'text', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'text' }
-            }
-            block.text += delta.content
-            yield { type: 'text-delta', index: block.index, text: delta.content }
+            // 通过 DSML 提取器：纯文本作为 text-delta 放行，
+            // <thought> 内容作为 reasoning-delta 放行（显示在 Think 区域），
+            // DSML 块解析为结构化 tool-call（与 delta.tool_calls 路径
+            // 合并到同一 toolCalls/toolOrder 状态）。
+            const { text, reasoning, toolCalls: dsmlCalls } = dsmlContentExtractor.feed(delta.content)
+            yield* emitDsmlFeed(text, reasoning, dsmlCalls)
           }
           if (delta?.reasoning_content) {
-            let block = blocks.find(candidate => candidate.kind === 'reasoning')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'reasoning', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            // 模型放在 reasoning_content 通道的内容就是思考，必须进入
+            // reasoning 块（Think 区域），绝不能作为正文输出。实测
+            // （2026-08-22）：deepseek-v4-flash 的 reasoning_content 通常
+            // 没有 <thought> 标签，提取器会把整段当作 `text` 返回——若把
+            // `text` 发给正文块，思考就泄漏到正文（TUI 显示 The user wants
+            // me to... 跑到正文）。因此这里把 `text + reasoning` 合并后
+            // 全部作为 reasoning 输出，仅 DSML 工具调用块单独解析执行。
+            const { text, reasoning, toolCalls: reasoningDsmlCalls } = dsmlReasoningExtractor.feed(delta.reasoning_content)
+            const thinking = text + reasoning
+            if (thinking.length > 0) {
+              let block = blocks.find(candidate => candidate.kind === 'reasoning')
+              if (block === undefined) {
+                block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                blocks.push(block)
+                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+              }
+              block.text += thinking
+              yield { type: 'reasoning-delta', index: block.index, text: thinking }
             }
-            block.text += delta.reasoning_content
-            yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+            for (const call of reasoningDsmlCalls) {
+              const wireIndex = toolCalls.size
+              const block = {
+                index: nextIndex++,
+                text: call.arguments,
+                name: call.name,
+                callId: CallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+              }
+              toolCalls.set(wireIndex, block)
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: block.callId,
+                name: block.name,
+                argumentsDelta: call.arguments,
+              }
+            }
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
@@ -552,14 +1143,37 @@ export class CodeArtsAdapter extends LlmAdapter {
     } finally {
       reader.releaseLock()
     }
-    // 按创建顺序关闭每个块。CodeArts GLM 端点有时
-    // 将整个回答作为 reasoning_content 发出且 content 为空：回退到
-    // 推理作为可见文本，确保用户始终能收到回复。
+    // 流结束：分别 flush content 与 reasoning_content 两个独立 DSML 提取器。
+    // 若模型输出了不完整的 DSML 块（被 max_tokens 截断或模型异常终止），
+    // 残留内容作为纯文本放行，避免吞掉用户可见内容；不完整的 <thought>
+    // 块作为 reasoning 放行，避免推理泄漏到正文；同时让 finish_reason='length'
+    // 路径生效，触发 harness max-tokens 续写而非执行不完整工具调用。
+    // 复用 emitDsmlFeed 把残留 text/reasoning 路由到对应块。
+    {
+      const f = dsmlContentExtractor.flush()
+      if (f.text.length > 0 || f.reasoning.length > 0) yield* emitDsmlFeed(f.text, f.reasoning, [])
+    }
+    {
+      const f = dsmlReasoningExtractor.flush()
+      if (f.text.length > 0 || f.reasoning.length > 0) yield* emitDsmlFeed(f.text, f.reasoning, [])
+    }
+    // 按创建顺序关闭每个块。GLM 端点偶尔把整个回答作为 reasoning_content
+    // 发出且 content 为空：此时正文区为空，回退用推理文本填充可见区。
+    // 但若推理中解析出了 DSML 工具调用（deepseek-v4 的 reasoning_content
+    // 内嵌工具块），正文由工具调用承担，不再把推理复制为可见文本。
     const textBlock = blocks.find(block => block.kind === 'text')
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
+    // visible 回退：正文为空且无工具调用时，用推理文本填充可见区（GLM 端点
+    // 偶尔把整个回答作为 reasoning_content 输出）。但若推理含 DSML 标签
+    // （deepseek-v4 在推理中引用 DSML 语法讨论实现方案，非完整工具调用块），
+    // 不能复制为正文——DSML 标签泄漏到正文会被模型当用户输入，导致任务
+    // 终止或循环（实测 session-a69fa289 turn2 step26：推理仅含 DSML 闭合
+    // 标签片段，visible 回退复制到正文后任务终止）。此时正文留空，推理仍
+    // 在 Think 区域可见。
+    const reasoningHasDsml = reasoningBlock !== undefined && reasoningBlock.text.includes('｜DSML｜')
     const visible = textBlock !== undefined && textBlock.text !== ''
       ? textBlock.text
-      : reasoningBlock !== undefined ? reasoningBlock.text : ''
+      : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningBlock.text : ''
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
       yield {
