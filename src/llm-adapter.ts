@@ -764,6 +764,13 @@ export class CodeArtsAdapter extends LlmAdapter {
       model: options.model,
       messages,
       stream: true,
+      // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回 cached_tokens，
+      // 缺少该字段时缓存命中恒为 0（实测 2026-08-24）。
+      prompt_cache_key: this.sessionId,
+      // include/reasoning_summary 对齐 Rust 端 CodeArtsExtraFields，
+      // 让服务端返回加密 reasoning 内容与摘要。
+      include: ['reasoning.encrypted_content'],
+      reasoning_summary: 'auto',
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
@@ -1130,11 +1137,20 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
           }
           if (data.usage) {
+            const promptTokens = data.usage.prompt_tokens ?? 0
+            const cachedTokens = (data.usage as { prompt_tokens_details?: { cached_tokens?: number } }).prompt_tokens_details?.cached_tokens
+              ?? (data.usage as { prompt_cache_hit_tokens?: number }).prompt_cache_hit_tokens
+              ?? 0
+            const cacheWriteTokens = (data.usage as { prompt_tokens_details?: { cache_write_tokens?: number } }).prompt_tokens_details?.cache_write_tokens
+            const reasoningTokens = (data.usage as { completion_tokens_details?: { reasoning_tokens?: number } }).completion_tokens_details?.reasoning_tokens
             yield {
               type: 'usage',
               usage: {
-                inputTokens: data.usage.prompt_tokens ?? 0,
+                inputTokens: cachedTokens > 0 ? promptTokens - cachedTokens : promptTokens,
                 outputTokens: data.usage.completion_tokens ?? 0,
+                ...cachedTokens > 0 ? { cacheReadTokens: cachedTokens } : {},
+                ...cacheWriteTokens !== undefined && cacheWriteTokens > 0 ? { cacheWriteTokens } : {},
+                ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
               },
             }
           }
