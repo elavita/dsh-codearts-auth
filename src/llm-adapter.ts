@@ -715,6 +715,17 @@ export class CodeArtsAdapter extends LlmAdapter {
     return Promise.resolve(resolved)
   }
 
+  prepareCall(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    return Promise.resolve({
+      model: { provider, id: model, name: model, inputModalities: ['text'] as const },
+      stream: (options: GenerateOptions) => this.stream(options),
+    })
+  }
+
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     let credential = await this.options.resolveCredential()
     if (credential === undefined || Date.parse(credential.expires_at) <= Date.now()) {
