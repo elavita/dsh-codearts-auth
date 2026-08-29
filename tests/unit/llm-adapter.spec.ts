@@ -82,6 +82,23 @@ describe('CodeArtsAdapter', () => {
     expect(pangu.context).toBeUndefined()
   })
 
+  // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
+  // registration.adapter.prepareCall()，而本仓库链接的副本（0.1.0-rc.6）
+  // 的 LlmAdapter 基类没有该方法——缺少时每轮请求都以
+  // `registration.adapter.prepareCall is not a function` 失败。
+  it('prepareCall resolves the model and binds its stream', async () => {
+    const adapter = makeAdapter()
+    expect(typeof adapter.prepareCall).toBe('function')
+    const call = await adapter.prepareCall('codearts', 'GLM-5.2')
+    expect(call.model).toMatchObject({
+      provider: 'codearts',
+      id: 'GLM-5.2',
+      context: { contextWindow: 202752 },
+      inputModalities: ['text'],
+    })
+    expect(typeof call.stream).toBe('function')
+  })
+
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
     const fetchImpl = vi.fn(async () => new Response(
       'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
@@ -504,6 +521,28 @@ describe('CodeArtsAdapter', () => {
     expect(finishKind).toBe('tool-calls')
   })
 
+  // 回归：tool_stream 分段传输时，参数续分片会带回 `"function":{"name":""}`。
+  // 空串不是 undefined，原先的 `!== undefined` 判断会用它覆盖首个分片解析出
+  // 的真实工具名，最终 block-end 输出 name:""，harness 报 `unknown tool ""`。
+  it('ignores an empty function name on tool_calls argument continuation fragments', async () => {
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"bash","arguments":""}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\\"command\\":\\"ls -"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"la\\"}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    let toolCallBlock: { type: 'tool-call'; id: string; name: string; arguments: string } | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'tool-call-delta') expect(chunk.name).toBe('bash')
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') toolCallBlock = chunk.block
+    }
+    expect(toolCallBlock).toMatchObject({ type: 'tool-call', id: 'call-1', name: 'bash' })
+    expect(JSON.parse(toolCallBlock!.arguments)).toEqual({ command: 'ls -la' })
+  })
+
   it('serializes harness tool schemas into the request tools field', async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const sent = JSON.parse(String(init?.body ?? '{}')) as {
@@ -903,7 +942,6 @@ describe('CodeArtsAdapter', () => {
     // 修复后 tryParseScalar 对 [ / { 开头的合法 JSON 还原为原始类型。
     const todosJson = JSON.stringify([
       { content: '了解项目结构', status: 'in_progress' },
-      { content: '实现 atomcode provider', status: 'pending' },
     ])
     const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="todo_write">'
       + `<｜DSML｜parameter name="todos" string="true">${todosJson}</｜DSML｜parameter>`
@@ -951,7 +989,6 @@ describe('CodeArtsAdapter', () => {
     expect(Array.isArray(args.todos)).toBe(true)
     expect(args.todos).toEqual([
       { content: '了解项目结构', status: 'in_progress' },
-      { content: '实现 atomcode provider', status: 'pending' },
     ])
   })
 
@@ -987,10 +1024,10 @@ describe('CodeArtsAdapter', () => {
     expect(texts.join('')).toBe('Fix DSML parsing')
   })
 
-  it('keeps deepseek-v4 on standard tool_calls mode when tools are small-parameter only (read/bash)', async () => {
-    // 纯 read/bash 等小参数工具不应触发 DSML 工具模式（实测单次 read 两种
-    // 模式耗时几乎相同，但 DSML 会让模型 reasoning 略长、finish_reason
-    // 变为 stop，且要求模型先理解 DSML 语法——不值得付出这些代价）。
+  it('switches deepseek-v4 to DSML tool mode even with small-parameter-only tools (read/bash)', async () => {
+    // deepseek-v4 模型始终走 DSML 模式（不论工具列表）：标准 tool_calls 模式下
+    // `subagent` 工具的长 prompt 参数生成期间 SSE 无数据，APIG 网关 ~60s 空闲超时
+    // 必然掐断连接。DSML 模式让工具调用通过 delta.content 流式输出，全程有数据流。
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const sent = JSON.parse(String(init?.body ?? '{}')) as {
         model?: string
@@ -998,31 +1035,14 @@ describe('CodeArtsAdapter', () => {
         messages?: Array<Record<string, unknown>>
       }
       expect(sent.model).toBe('deepseek-v4-flash')
-      // 保持标准 tools 字段，且不注入 DSML system 提示。
-      expect(sent.tools).toBeDefined()
-      expect(sent.tools).toHaveLength(1)
+      // DSML 模式：不发送 tools 字段（对齐 IDE 请求体），schema 注入 system 消息。
+      expect(sent.tools).toBeUndefined()
       const wire = sent.messages ?? []
-      expect(wire.some(message => message.role === 'system')).toBe(false)
-      // 模型以标准 tool_calls 输出，适配器照常解析。
+      expect(wire.some(message => message.role === 'system' && typeof message.content === 'string'
+        && message.content.includes('<｜DSML｜tool_calls>'))).toBe(true)
+      // 模型以 DSML 格式输出，适配器从 delta.content 解析。
       return new Response(
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a.ts\\"}"}}]}}]}\n\n'
-        + 'data: [DONE]\n\n',
-        { status: 200, headers: { 'content-type': 'text/event-stream' } },
-      )
-    })
-    const adapter = makeAdapter({ fetchImpl })
-    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
-    const opts = {
-      provider: 'codearts',
-      model: 'deepseek-v4-flash',
-      messages: [{ role: 'user', content: 'read a file' }],
-      tools: [{
-        name: 'read',
-        description: 'Read a file',
-        parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] },
-      }],
-      signal: new AbortController().signal,
-    } as never
+        'data: {"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\\"read\\"><｜DSML｜parameter name=\\"filePath\\" string=\\"true\\">/tmp/a.ts
     for await (const chunk of adapter.stream(opts)) {
       if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
         toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
@@ -1065,6 +1085,70 @@ describe('CodeArtsAdapter', () => {
         ] },
         { role: 'user', content: [
           { type: 'tool-result', toolCallId: 'call-9', content: [{ type: 'text', text: 'src/ lib/' }] },
+        ] },
+      ],
+      tools: [{ name: 'bash', description: 'Run a shell command', parameters: {} }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const _ of adapter.stream(opts)) { /* drain */ }
+    expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  // 回归（严重）：工具执行失败时 assistant 的 tool_calls 留在会话历史里，
+  // 但结果消息从未写回——形成孤儿 tool_calls。坏历史随每次请求重放，后端
+  // 对之后**每一条**用户消息都返回 400，表现为"任务中断后发送任何内容都
+  // 没有回复"。适配器必须在发出请求前剔除。
+  it('drops orphan tool_calls that never received a tool result', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<Record<string, unknown>>
+      }
+      const wire = sent.messages ?? []
+      const assistant = wire.find(message => message.role === 'assistant') as Record<string, unknown> | undefined
+      expect(assistant?.tool_calls).toBeUndefined()
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const opts = {
+      provider: 'codearts',
+      model: 'GLM-5.2',
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool-call', id: 'call-9', name: 'bash', arguments: '{"command":"ls"}' },
+        ] },
+        // 工具执行失败，没有对应的 tool-result 写回历史。
+        { role: 'user', content: 'continue' },
+      ],
+      tools: [{ name: 'bash', description: 'Run a shell command', parameters: {} }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const _ of adapter.stream(opts)) { /* drain */ }
+    expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  it('drops orphan tool result messages with no matching tool_call', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<Record<string, unknown>>
+      }
+      const wire = sent.messages ?? []
+      expect(wire.some(message => message.role === 'tool')).toBe(false)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const opts = {
+      provider: 'codearts',
+      model: 'GLM-5.2',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'user', content: [
+          { type: 'tool-result', toolCallId: 'ghost', content: [{ type: 'text', text: 'x' }] },
         ] },
       ],
       tools: [{ name: 'bash', description: 'Run a shell command', parameters: {} }],

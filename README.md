@@ -6,6 +6,10 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
+此外插件内置另外两个 provider 路由：
+
+- **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)。
+
 ## 安装
 
 该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
@@ -144,3 +148,35 @@ Tokens 福利）。
 生成 `ticket_id`，打开 `devcloud.cn-north-4.huaweicloud.com/doer/redirect` 认证页，
 回调后轮询 snap-manager ticket 端点（120 × 1 秒）获取临时凭证；此类凭据没有
 `refresh_token`，其续期仍意味着重新运行浏览器登录流程。
+
+## buddy provider
+
+独立路由 `buddy`（腾讯 CodeBuddy，OpenAI 兼容端点
+`https://copilot.tencent.com/v2/chat/completions`），Bearer `access_token` 鉴权。
+
+登录采用 external-link-v2 轮询式（与 CodeArts 的本地回调服务器不同，CodeBuddy
+不起本地端口，而是轮询后端 API）：
+
+1. `POST /v2/plugin/auth/state?platform=ide` → 取得 `state` 与 `authUrl`。
+2. 打开浏览器到 `https://www.codebuddy.cn/login/?platform=ide&state=...`。
+3. 轮询 `GET /v2/plugin/auth/token?state=...`（1 秒间隔、5 分钟超时）→ 令牌；
+   错误码 `11217` 表示 token 未就绪，继续轮询。
+4. 轮询 `GET /v2/plugin/login/account?state=...` → 账户信息；错误码 `12151`
+   表示账户信息未就绪，继续轮询。
+5. 续期：`POST /v2/plugin/auth/token/refresh`，通过 `X-Refresh-Token` 头提交
+   refresh_token。
+
+- 命令：`/buddy-login`、`/buddy-status`、`/buddy-refresh`。
+- 编程式调用：`ctx.buddyAuth.login()` / `status()` / `refresh()` / `logout()` /
+  `fetchModels()`。
+- 模型列表：登录后从 `GET /v3/config`（craft agent 的 `models`）动态拉取，
+  拉取失败时回退到内置静态列表（DeepSeek V4、Hy4、GLM、Kimi、MiniMax 等）。
+- 请求头：除 `Authorization: Bearer` 外，还需 `X-Domain`、`X-Product`、
+  `X-Product-Code` 以及伪装为 `CodeBuddyIDE/1.106.1` 的 `User-Agent`。
+- 凭据 ref：`BUDDY_ACCESS_TOKEN`，值为含 `access_token` / `refresh_token` /
+  `expires_at` 的 JSON 字符串。
+
+> **流式工具调用 id 稳定性**：CodeBuddy 仅首个工具调用分片携带真实 id
+> （`chatcmpl-tool-xxx`），后续参数分片只有 `index`。适配器按 index 缓存并沿用
+> 真实 id（缺失时回退 `call_{index}`），保证同一工具的所有分片 id 一致——否则
+> 跨轮次（每轮都从 `call_0` 重新编号）会把 `tool/result` 配对到错误的历史条目。

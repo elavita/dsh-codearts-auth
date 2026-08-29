@@ -1,5 +1,3 @@
-import { RefreshTokenExpiredError } from './oauth.js'
-
 /** 在凭据过期前提前这么长时间触发刷新（1 小时；对齐真实插件的 36e5）。 */
 export const REFRESH_LEAD_MS = 3_600_000
 /** 普通刷新失败后的重试间隔（10 分钟；对齐 RENEW_TOKEN_INTERVAL_WHEN_LAST_TIME_FAILED）。 */
@@ -11,6 +9,19 @@ export const REFRESH_ABNORMAL_NETWORK_RETRY_MS = 60_000
 function isAbnormalNetworkError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /fetch failed|ENOTFOUND|ECONNREFUSED|proxy|unresolved host|getaddrinfo/i.test(message)
+}
+
+/**
+ * 判定 refresh_token 是否已失效（终态：停止调度并提示重新登录）。
+ *
+ * 结构化判定而非 instanceof：CodeArts（oauth.ts）与 Buddy（buddy-oauth.ts）
+ * 各自导出同名 `RefreshTokenExpiredError`，跨模块 identity 不同，
+ * 用 instanceof 会让其中一个 provider 的失效信号穿透为「可重试」而无限重试。
+ */
+function isRefreshTokenExpired(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  if (error.name === 'RefreshTokenExpiredError') return true
+  return /refresh[_ ]?token/i.test(error.message)
 }
 
 /**
@@ -83,8 +94,8 @@ export class RefreshScheduler {
         // 在途期间被 stop()/arm() 打断：放弃本次失败后的重试，避免登出后调度器复活。
         return
       }
-      if (error instanceof RefreshTokenExpiredError) {
-        // refresh_token 已失效：停止调度，提示重新登录。
+      if (isRefreshTokenExpired(error)) {
+        // refresh_token 已失效（终态）：停止调度，提示重新登录。
         return
       }
       // 在途期间可能已新 arm()（this.timer 已指向新定时器 T2）：先清除，避免覆盖后 T2 沦为孤儿定时器。

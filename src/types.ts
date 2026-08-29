@@ -62,3 +62,9 @@ export interface LoginFlowOptions {
   /** 登录流程选择：'oauth'（默认）或 'ticket'（旧流程回退）。 */
   flow?: 'oauth' | 'ticket'
 }
+
+/**
+ * buddy (腾讯 CodeBuddy) 凭据，存储在 BUDDY_ACCESS_TOKEN 下。
+ * 定义与解析工具放在 buddy.ts（与 CodeBuddy 协议常量同处一处）。
+ */
+export type { BuddyCredential } from './buddy.js'

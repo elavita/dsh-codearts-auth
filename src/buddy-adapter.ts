@@ -1,0 +1,610 @@
+/**
+ * buddy (腾讯 CodeBuddy) LlmAdapter
+ *
+ * 使用标准 OpenAI Chat Completions 协议 + Bearer access_token 鉴权。
+ * 认证由 buddy-auth.ts 服务完成（external-link-v2 轮询式登录 + refresh_token 续期）。
+ *
+ * 端点：https://copilot.tencent.com/v2/chat/completions
+ * 模型列表：静态默认（对齐 /v3/config craft agent models）+ 登录后的动态拉取
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import {
+  attributionHeaders, CallId,
+  LlmAdapter, LlmError,
+} from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import {
+  API_DOMAIN,
+  BUDDY_DEPLOYMENT_TYPE,
+  BUDDY_PRODUCT_CODE,
+  BUDDY_USER_AGENT,
+  HTTP_HEADER_DOMAIN,
+  HTTP_HEADER_PRODUCT,
+  HTTP_HEADER_PRODUCT_CODE,
+  credentialExpiresAtMs,
+} from './buddy.js'
+import type { BuddyCredential } from './buddy.js'
+import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+
+export const CHAT_API_BASE = 'https://copilot.tencent.com/v2'
+export const PROVIDER = 'buddy'
+
+/** 静态默认模型（对齐 /v3/config 返回的 craft agent models；动态拉取失败时的兜底）。 */
+const DEFAULT_MODELS: readonly string[] = [
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'hy4-preview',
+  'hy4-preview-x',
+  'hy3',
+  'hy3-x',
+  'glm-5.3',
+  'glm-5.3-flash',
+  'glm-5.2',
+  'glm-5.1',
+  'glm-5v-turbo',
+  'kimi-k3-1',
+  'kimi-k2.7',
+  'kimi-k2.6',
+  'minimax-m3',
+]
+
+/** 默认模型（deepseek-v4-flash，对齐 IDE 默认）。 */
+export const DEFAULT_MODEL = 'deepseek-v4-flash'
+
+/** 模型上下文窗口（对齐 Rust BuddyProvider::context_limit）。 */
+const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
+  ['deepseek-v4-flash', 1_000_000],
+  ['deepseek-v4-pro', 1_000_000],
+  ['hy4-preview', 192_000],
+  ['hy4-preview-x', 192_000],
+  ['hy3', 192_000],
+  ['hy3-x', 192_000],
+  ['glm-5.3', 200_000],
+  ['glm-5.3-flash', 200_000],
+  ['glm-5.2', 200_000],
+  ['glm-5.1', 200_000],
+  ['glm-5v-turbo', 200_000],
+  ['kimi-k3-1', 200_000],
+  ['kimi-k2.7', 200_000],
+  ['kimi-k2.6', 200_000],
+  ['minimax-m3', 200_000],
+])
+
+export interface BuddyAdapterOptions {
+  credentialRef: CredentialRef
+  /** 从凭据存储解析凭据。 */
+  resolveCredential: () => Promise<BuddyCredential | undefined>
+  /** 静默续期凭据。 */
+  refresh: () => Promise<void>
+  /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchImpl?: typeof fetch
+}
+
+/** 将消息内容载荷展平为纯文本字符串。 */
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block): block is { type: string; text: unknown } =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
+    .map((block) => String(block.text))
+    .join('')
+}
+
+/**
+ * 将 harness 对话消息序列化为 CodeBuddy chat-completions 的传输格式。
+ *
+ * 与 openai_chat/codearts 适配器一致：assistant 的 `tool-call` 块转为
+ * `tool_calls`，`reasoning` 块折叠为 `reasoning_content`，user 消息中搭载的
+ * 工具结果展开为独立的 `{role: 'tool'}` 消息。
+ *
+ * 两点 CodeBuddy 特有要求（对齐 Rust buddy.rs）：
+ * - assistant 消息**始终**携带 `reasoning_content` 字段（推理模型缺失会 400）
+ *   ——与 codearts 的 deepseek-v4 校验一致；
+ * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
+ */
+function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
+  const wire: Array<Record<string, unknown>> = []
+
+  // ── 孤儿工具调用清理（会话续命的关键）──
+  // OpenAI 兼容协议要求：带 `tool_calls` 的 assistant 消息，其**每一个**
+  // tool_call id 都必须紧跟一条对应的 `role:'tool'` 结果消息；反之，
+  // `role:'tool'` 消息也必须有对应的前置 tool_call。缺任一侧，后端都会以
+  // 400 拒绝整个请求。
+  //
+  // 工具执行失败时（参数非法、超时、工具不存在……）harness 会把 assistant
+  // 的 tool_calls 持久化进会话历史，却写不回结果消息。这条坏历史随后被
+  // **每次请求原样重放**，于是后端对之后每一条用户消息都返回 400——表现为
+  // "任务突然中断，此后发送任何内容都没有回复"，整个会话彻底报废。
+  //
+  // 适配器是最后一道防线：发出请求前把无法配对的 tool_calls 与 tool 结果
+  // 一并剔除，让会话自愈。宁可丢失一轮工具上下文，也好过整条会话死亡。
+  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      const content = Array.isArray(message.content) ? message.content : []
+      const toolCallBlocks = content
+        .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
+          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
+        .filter(block => keepCallIds.has(String(block.id)))
+      const toolCalls = toolCallBlocks.map((block) => ({
+        id: String(block.id),
+        type: 'function' as const,
+        function: { name: String(block.name), arguments: normalizeToolArguments(String(block.arguments)) },
+      }))
+      const reasoning = content
+        .filter((block): block is { type: string; text: unknown } =>
+          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
+        .map((block) => String(block.text))
+        .join('')
+      const text = contentToText(content)
+      wire.push({
+        role: 'assistant',
+        // 正文为空且有工具调用时 content 必须为 null（对齐 openai_chat.rs）。
+        content: text.length === 0 && toolCalls.length > 0 ? null : text,
+        reasoning_content: reasoning,
+        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
+      })
+      continue
+    }
+    if (message.role === 'system') {
+      wire.push({ role: 'system', content: contentToText(message.content) })
+      continue
+    }
+    // user 角色：工具结果搭载在 harness 用户消息中；展开为独立的 role:'tool' 消息。
+    const content = Array.isArray(message.content) ? message.content : []
+    const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
+    const text = contentToText(message.content)
+    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    for (const result of toolResults) {
+      // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
+      if (!keepResultIds.has(String(result.toolCallId))) continue
+      wire.push({
+        role: 'tool',
+        tool_call_id: String(result.toolCallId),
+        content: contentToText(result.content) || '(no output)',
+      })
+    }
+  }
+  return wire
+}
+
+/** 安全读取 Error.message。 */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try { return String(error) } catch { return 'unknown error' }
+}
+
+/** 从错误体提取可读 detail 文本。 */
+function errorDetail(body: string): string {
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const error = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const parts = [
+      typeof error?.code === 'string' ? error.code : undefined,
+      typeof error?.type === 'string' ? error.type : undefined,
+      typeof error?.message === 'string' ? error.message : undefined,
+      typeof data.message === 'string' ? data.message : undefined,
+    ].filter((value): value is string => value !== undefined)
+    if (parts.length > 0) return parts.join(' ')
+  } catch {
+    // 非 JSON 错误体
+  }
+  return body
+}
+
+/** 将 HTTP 状态码映射为 harness 错误码。 */
+function httpErrorCode(status: number): string {
+  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 429) return 'RATE_LIMIT'
+  if (status === 400) return 'INVALID_REQUEST'
+  if (status >= 500) return 'SERVER'
+  return `HTTP_${status}`
+}
+
+/**
+ * SSE 流空闲超时。buddy（CodeBuddy）后端对 SSE 连接有空闲断连策略：模型
+ * 生成超长推理或大工具调用参数时，两次 chunk 之间可能静默数十秒。原实现
+ * 直接 `await reader.read()` 且没有任何超时——连接被服务端掐断后若对端
+ * 既不发数据也不关连接（半开连接），read() 会**永久挂起**，generator 永不
+ * 返回，harness 当前步骤既不出结果也不报错，会话永久停留在"运行中"：web
+ * 端表现为进度停止、发送按钮置灰、后续"继续"指令完全无响应。
+ *
+ * 主动以略小于后端超时窗口的间隔检测空闲，超时则取消 reader 并抛可重试
+ * 的 TIMEOUT，让 harness 重试该步骤并把控制权交还给用户。
+ *
+ * 分两个阶段，与 codearts 适配器保持一致：
+ * - firstTokenTimeout：等待首个 chunk 的窗口（模型排队 / 长思考时较长）；
+ * - chunkTimeout：收到首 chunk 后，两次 chunk 之间的最大静默（每次成功
+ *   读取后重置）。
+ *
+ * 两者均可由环境变量覆盖（毫秒，整数），便于测试用短超时触发 TIMEOUT 路径，
+ * 或线上针对特定模型调优。在每次 stream() 调用时读取，避免模块顶层常量
+ * 在 import 时定型导致测试中设置环境变量不生效。
+ */
+function resolveFirstTokenTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_BUDDY_SSE_FIRST_TOKEN_TIMEOUT_MS ?? '', 10) || 120_000
+}
+function resolveChunkTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_BUDDY_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
+}
+
+/** 判断是否为传输级错误。 */
+function isTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message.toLowerCase()
+  if (message.includes('terminated')) return true
+  if (error.name.startsWith('UND_ERR_')) return true
+  if (message.includes('fetch failed')) return true
+  if (message.includes('econnreset') || message.includes('epipe') || message.includes('socket hang up')) return true
+  return false
+}
+
+/** buddy (腾讯 CodeBuddy) 模型适配器。使用 Bearer access_token 鉴权。 */
+export class BuddyAdapter extends LlmAdapter {
+  private readonly fetchImpl: typeof fetch
+  /** 动态模型缓存（首次 listModels 成功后填充）。 */
+  private remoteModels: Array<{ id: string; name: string }> | undefined
+
+  constructor(private readonly options: BuddyAdapterOptions) {
+    super()
+    this.fetchImpl = options.fetchImpl ?? fetch
+  }
+
+  providerInfo(provider: string): LlmProviderInfo {
+    return { id: provider, name: 'CodeBuddy (Tencent)' }
+  }
+
+  /**
+   * 模型列表：优先使用 /v3/config 动态拉取的远端列表，否则回退静态默认。
+   * 动态拉取失败时静默回退（与 Rust fetch_models 的 Vec::new() 语义一致）。
+   */
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    if (this.remoteModels === undefined && this.options.fetchRemoteModels !== undefined) {
+      try {
+        const models = await this.options.fetchRemoteModels()
+        if (models.length > 0) this.remoteModels = models
+      } catch {
+        // 远端不可用：回退静态列表
+      }
+    }
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    return source.map((model) => ({
+      provider: PROVIDER, id: model.id, name: model.name, inputModalities: ['text'],
+    }))
+  }
+
+  resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    const contextWindow = CONTEXT_WINDOWS.get(model)
+    const resolved: LlmResolvedModelInfo = { provider, id: model, name: model }
+    if (contextWindow !== undefined) resolved.context = { contextWindow }
+    return Promise.resolve(resolved)
+  }
+
+  /**
+   * 兼容 0.1.1-rc.2：新版 LlmRuntime.prepareCall() 会调用
+   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
+   * （0.1.0-rc.6）的 LlmAdapter 基类尚未提供该方法，缺少时会在每轮请求
+   * 开始时抛 `registration.adapter.prepareCall is not a function`。这里把
+   * 模型解析与分发绑定到同一个适配器实例（与 CodeArtsAdapter 同款 shim）。
+   */
+  async prepareCall(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    return {
+      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] as const },
+      stream: (options: GenerateOptions) => this.stream(options),
+    }
+  }
+
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // 1. 获取凭据（过期则先静默续期）
+    let credential = await this.options.resolveCredential()
+    if (credential === undefined || isCredentialExpired(credential)) {
+      await this.options.refresh()
+      credential = await this.options.resolveCredential()
+    }
+    if (credential === undefined || credential.access_token.length === 0) {
+      throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
+    }
+
+    // 2. 序列化消息
+    const messages = serializeMessages(options.messages)
+    if (options.system !== undefined && options.system.length > 0) {
+      messages.unshift({ role: 'system', content: options.system })
+    }
+    const tools = options.tools?.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }))
+
+    // 3. 构造请求体
+    const bodyObj: Record<string, unknown> = {
+      model: options.model,
+      messages,
+      stream: true,
+    }
+    if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
+    if (options.temperature !== undefined) bodyObj.temperature = options.temperature
+    if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
+    const body = JSON.stringify(bodyObj)
+
+    // 4. 发送请求（401/403 时刷新一次凭据后重试）
+    let response = await this.send(credential, body, options)
+    if (!response.ok && (response.status === 401 || response.status === 403)) {
+      await this.options.refresh()
+      credential = await this.options.resolveCredential()
+      if (credential === undefined || credential.access_token.length === 0) {
+        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status })
+      }
+      response = await this.send(credential, body, options)
+    }
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '')
+      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+    }
+
+    // 5. 消费 SSE 流
+    yield* this.consumeSse(response, options)
+  }
+
+  /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
+  private async send(
+    credential: BuddyCredential,
+    body: string,
+    options: GenerateOptions,
+  ): Promise<Response> {
+    const headers = new Headers(attributionHeaders())
+    headers.set('Authorization', `Bearer ${credential.access_token}`)
+    headers.set('Accept', 'text/event-stream')
+    headers.set('Content-Type', 'application/json')
+    headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? API_DOMAIN)
+    headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
+    headers.set(HTTP_HEADER_PRODUCT_CODE, BUDDY_PRODUCT_CODE)
+    // User-Agent 必须伪装为 CodeBuddy IDE（后端以此识别客户端）。
+    headers.set('User-Agent', BUDDY_USER_AGENT)
+    try {
+      return await this.fetchImpl(`${CHAT_API_BASE}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body,
+        signal: options.signal,
+      })
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      if (isTransportError(error)) {
+        throw new LlmError(`buddy: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+      }
+      throw error
+    }
+  }
+
+  /**
+   * 消费 SSE 响应并产出 StreamChunk。
+   *
+   * CodeBuddy 返回标准 OpenAI SSE：`delta.content` 为正文、
+   * `delta.reasoning_content` 为思考、`delta.tool_calls` 为工具调用。
+   * 流式工具调用仅首个分片携带真实 id（chatcmpl-tool-xxx），后续参数分片
+   * 只有 index——按 index 缓存 id 保证同一工具的所有分片 id 一致。
+   */
+  private async *consumeSse(
+    response: Response,
+    options: GenerateOptions,
+  ): AsyncIterable<StreamChunk> {
+    if (!response.body) throw new LlmError('buddy: empty model response body', 'EMPTY_RESPONSE')
+
+    const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
+    let nextIndex = 0
+    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    const toolOrder: number[] = []
+    // tool_call index → 后端签发的真实 id。缺失时回退 call_{index}，
+    // 保证 Start/Delta 使用同一 id。
+    const toolIds = new Map<number, string>()
+    let buffer = ''
+    let streamEnded = false
+    let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    // 首 token 与 chunk 间超时分阶段使用：第一次读取用 firstTokenTimeout，
+    // 收到首 chunk 后切换为 chunkTimeout 并在每次成功读取后重置。没有这层
+    // 保护时，半开的 SSE 连接会让 read() 永久挂起，会话卡死在"运行中"。
+    let firstTokenReceived = false
+
+    try {
+      for (;;) {
+        if (streamEnded) break
+        let result
+        try {
+          const timeoutMs = firstTokenReceived ? resolveChunkTimeoutMs() : resolveFirstTokenTimeoutMs()
+          const phase = firstTokenReceived ? 'chunk' : 'first-token'
+          result = await readWithIdleTimeout(reader, timeoutMs, 'buddy', options.signal, phase)
+          if (!result.done) firstTokenReceived = true
+        } catch (error) {
+          if (options.signal?.aborted) throw error
+          if (error instanceof LlmError) throw error
+          if (isTransportError(error)) {
+            throw new LlmError(`buddy: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+          }
+          throw error
+        }
+        if (result.done) break
+        buffer += decoder.decode(result.value, { stream: true })
+        let newline: number
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline).trim()
+          buffer = buffer.slice(newline + 1)
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (payload === '[DONE]') {
+            streamEnded = true
+            break
+          }
+          let data: {
+            error?: { message?: string }
+            choices?: Array<{
+              delta?: {
+                content?: string
+                reasoning_content?: string
+                tool_calls?: Array<{
+                  index?: number
+                  id?: string
+                  function?: { name?: string; arguments?: string }
+                }>
+              }
+              finish_reason?: string
+            }>
+            usage?: Record<string, number>
+          }
+          try {
+            data = JSON.parse(payload)
+          } catch {
+            continue
+          }
+          if (data.error !== undefined) {
+            throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, 'SERVER')
+          }
+          const choice = data.choices?.[0]
+          const delta = choice?.delta
+          if (typeof choice?.finish_reason === 'string') {
+            finishReason = choice.finish_reason as 'stop' | 'tool_calls' | 'length'
+          }
+          if (delta?.content) {
+            let block = blocks.find(candidate => candidate.kind === 'text')
+            if (block === undefined) {
+              block = { index: nextIndex++, kind: 'text', text: '' }
+              blocks.push(block)
+              yield { type: 'block-start', index: block.index, blockType: 'text' }
+            }
+            block.text += delta.content
+            yield { type: 'text-delta', index: block.index, text: delta.content }
+          }
+          if (delta?.reasoning_content) {
+            let block = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (block === undefined) {
+              block = { index: nextIndex++, kind: 'reasoning', text: '' }
+              blocks.push(block)
+              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            }
+            block.text += delta.reasoning_content
+            yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+          }
+          for (const call of delta?.tool_calls ?? []) {
+            const wireIndex = call.index ?? 0
+            if (typeof call.id === 'string' && call.id.length > 0) {
+              toolIds.set(wireIndex, call.id)
+            }
+            const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
+            let block = toolCalls.get(wireIndex)
+            if (block === undefined) {
+              block = { index: nextIndex++, text: '', callId }
+              toolCalls.set(wireIndex, block)
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+            }
+            block.callId = callId
+            // 后续参数分片会带上空的 function.name（""），它不是 undefined，
+            // 直接覆盖会把首个分片解析出的真实工具名清空，导致
+            // `unknown tool ""`。只有非空名字才允许更新。
+            if (typeof call.function?.name === 'string' && call.function.name.length > 0) {
+              block.name = call.function.name
+            }
+            const fragment = call.function?.arguments ?? ''
+            block.text += fragment
+            yield {
+              type: 'tool-call-delta',
+              index: block.index,
+              id: CallId(callId),
+              ...block.name !== undefined ? { name: block.name } : {},
+              argumentsDelta: fragment,
+            }
+          }
+          if (data.usage) {
+            yield {
+              type: 'usage',
+              usage: {
+                inputTokens: data.usage.prompt_tokens ?? 0,
+                outputTokens: data.usage.completion_tokens ?? 0,
+              },
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    // 按创建顺序关闭每个块
+    const textBlock = blocks.find(block => block.kind === 'text')
+    for (const index of toolOrder) {
+      const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      yield {
+        type: 'block-end',
+        index,
+        block: {
+          type: 'tool-call',
+          id: CallId(block.callId ?? ''),
+          name: block.name ?? '',
+          // 仅把"无参数工具下发的空分片"补成 {}；**残缺参数保持原样**，
+          // 由 max-tokens 判定触发重试。切勿把残缺 JSON 也补成 {}——那会
+          // 伪造出合法外观，让 harness 报 `missing required property` 而
+          // 非重试，掩盖真正的分片丢失。
+          arguments: isTruncatedArguments(block.text)
+            ? block.text
+            : normalizeToolArguments(block.text),
+        },
+      }
+    }
+    if (textBlock !== undefined) {
+      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+    }
+    const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
+    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
+      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+    }
+    // 三种"不完整"都必须报告 max-tokens 而非 tool-calls，否则 harness 会
+    // 执行残缺调用、报 INVALID_ARGS，并把脏参数持久化进会话历史：
+    // - 'length'：模型输出被 max_tokens 显式截断；
+    // - 未收到 finish_reason：连接被中途掐断，参数必然是半截 JSON；
+    // - 参数分片丢失：后端并行下发多个工具调用时偶发丢分片（实测
+    //   session-23851745 turn1 step4，两个并行 `read` 都丢了 `{"file_path": "…`
+    //   前缀）。此时报告 tool-calls 会让 harness 执行缺参调用，报
+    //   `missing required property "file_path"`，模型收到莫名其妙的参数错误
+    //   并陷入重试循环。判定为截断后 dsh 丢弃残缺调用并重试，实测一次即恢复。
+    const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+    const reason = finishReason === 'length'
+      || finishReason === undefined && toolOrder.length > 0
+      || argsTruncated
+      ? { kind: 'max-tokens' as const }
+      : finishReason === 'tool_calls' || toolOrder.length > 0
+        ? { kind: 'tool-calls' as const }
+        : { kind: 'stop' as const }
+    yield { type: 'finish', reason }
+  }
+}
+
+/** 凭据是否已过期；无法解析过期时间时不判定过期（与 Rust is_expired 一致）。 */
+function isCredentialExpired(credential: BuddyCredential): boolean {
+  const expiresAt = credentialExpiresAtMs(credential)
+  return expiresAt === undefined ? false : Date.now() >= expiresAt
+}
+
+/** 在 ctx.llm 上注册 buddy 提供商路由和适配器。 */
+export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
+  ctx.llm.registerConfigurableProviders([
+    { provider: PROVIDER, displayName: 'CodeBuddy (Tencent)', settingsNs: 'llm-buddy', settingsPath: [] },
+  ])
+  ctx.llm.registerAdapter([PROVIDER], new BuddyAdapter(options))
+}

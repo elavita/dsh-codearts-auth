@@ -6,6 +6,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { signRequestHuawei } from './sign.js'
+import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -71,16 +72,20 @@ function contentToText(content: unknown): string {
  */
 function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+  // 剔除无法配对的工具调用/结果（详见 resolveToolPairing）：孤儿 tool_calls
+  // 会让后端对之后每一条消息都返回 400，整个会话永久报废。
+  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
   for (const message of messages) {
     if (message.role === 'assistant') {
       const content = Array.isArray(message.content) ? message.content : []
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
+        .filter(block => keepCallIds.has(String(block.id)))
         .map((block) => ({
           id: String(block.id),
           type: 'function' as const,
-          function: { name: String(block.name), arguments: String(block.arguments) },
+          function: { name: String(block.name), arguments: normalizeToolArguments(String(block.arguments)) },
         }))
       const reasoning = content
         .filter((block): block is { type: string; text: unknown } =>
@@ -114,6 +119,8 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
     const text = contentToText(message.content)
     if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
     for (const result of toolResults) {
+      // 丢弃孤儿工具结果：没有对应 tool_call 其结果同样会让后端 400。
+      if (!keepResultIds.has(String(result.toolCallId))) continue
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
@@ -148,15 +155,28 @@ function isDeepseekV4Model(model: string): boolean {
 
 /**
  * 工具名匹配大参数写文件类工具（content/arguments 可能达到数万 token）。
- * 只有这类工具触发 deepseek-v4 的 DSML 工具模式；read/bash/glob 等小参数
- * 工具继续走标准 `tool_calls`（实测单次 read 两种模式耗时几乎相同，但
- * DSML 会让模型 reasoning 略长、`finish_reason` 变为 `stop`，且要求模型
- * 先理解 DSML 语法——对不需要大参数的工具不值得付出这些代价）。
+ * 仅用于对非 deepseek-v4 模型的 DSML 模式降级判定（当前全量模式不再使用此列表）。
  */
 const DSML_LARGE_PARAM_TOOLS = ['write', 'file_write', 'apply_patch']
-function needsDsmlToolMode(model: string, toolNames: readonly string[]): boolean {
-  if (!isDeepseekV4Model(model)) return false
-  return toolNames.some(name => DSML_LARGE_PARAM_TOOLS.includes(name))
+/**
+ * 判断模型是否应使用 DSML 原生工具调用语法输出。
+ *
+ * deepseek-v4 模型始终走 DSML 模式（不论工具列表中包含什么工具），原因：
+ * - 标准 `tool_calls` 模式要求参数一次性打包生成，SSE 流在生成参数期间长时间
+ *   无数据，APIG 网关 ~60s 空闲超时必然掐断连接（`terminated`），且后端不对
+ *   任何请求头发送心跳保活；
+ * - 除 write/file_write/apply_patch 外，`subagent` 的 `prompt` 参数也可能很长
+ *   （包含详细任务描述与上下文），同样面临网关断连风险；
+ * - DSML 模式使工具调用通过 `delta.content` 流式输出（全程有数据流），从根上
+ *   规避网关空闲断连，实测 1000 行 write content 的 DSML 流全程最大静默仅
+ *   204ms，146s 完整结束；
+ * - 模型行为统一，避免不同步骤间标准/DSML 模式切换引入的不一致。
+ *
+ * 非 deepseek-v4 模型（如 openpangu / GLM-5.2 等）使用华为标准 IAM AK/SK 鉴权，
+ * 不走 CodeArts Agent APIG 网关，无 60s 空闲断连问题，继续保持标准 tool_calls。
+ */
+function needsDsmlToolMode(model: string, _toolNames: readonly string[]): boolean {
+  return isDeepseekV4Model(model)
 }
 
 /**
@@ -375,43 +395,16 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * 在空闲超时内读取一个流块。超过 {@link timeoutMs} 无数据则取消
- * reader 并抛可重试的 `LlmError('TIMEOUT')`——比被动等待网关掐断更早
- * 失败，且归类为可重试 code。尊重用户传入的 {@link signal}：若已 abort
- * 则直接抛 abort 原因，不误报超时。
- *
- * {@link phase} 仅用于错误消息区分首 token 超时与 chunk 间超时。
+ * 在空闲超时内读取一个流块（实现见 {@link readWithIdleTimeout}）。
+ * 此处用 codearts 标签包一层，保持错误消息前缀与历史行为一致。
  */
-async function readWithIdleTimeout(
+function readCodeArtsChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number,
   signal?: AbortSignal,
   phase: 'first-token' | 'chunk' = 'chunk',
 ): Promise<{ done: boolean; value: Uint8Array | undefined }> {
-  if (signal?.aborted) throw signal.reason ?? new Error('aborted')
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const onUserAbort = (): void => { if (timer) clearTimeout(timer) }
-  signal?.addEventListener('abort', onUserAbort, { once: true })
-  const readPromise = reader.read()
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => { reject(new LlmError(`codearts: sse ${phase} timeout after ${timeoutMs}ms`, 'TIMEOUT')) }, timeoutMs)
-  })
-  try {
-    const result = await Promise.race([readPromise, timeoutPromise])
-    return { done: result.done, value: result.value }
-  } catch (error) {
-    // 用户取消：透传
-    if (signal?.aborted) throw signal.reason ?? error
-    // 空闲超时：取消 reader 释放底层连接，再抛可重试 TIMEOUT
-    if (error instanceof LlmError) {
-      await reader.cancel().catch(() => {})
-      throw error
-    }
-    throw error
-  } finally {
-    if (timer) clearTimeout(timer)
-    signal?.removeEventListener('abort', onUserAbort)
-  }
+  return readWithIdleTimeout(reader, timeoutMs, 'codearts', signal, phase)
 }
 
 /**
@@ -715,15 +708,15 @@ export class CodeArtsAdapter extends LlmAdapter {
     return Promise.resolve(resolved)
   }
 
-  prepareCall(
+  async prepareCall(
     provider: string,
     model: string,
     signal?: AbortSignal,
   ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return Promise.resolve({
-      model: { provider, id: model, name: model, inputModalities: ['text'] as const },
+    return {
+      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] as const },
       stream: (options: GenerateOptions) => this.stream(options),
-    })
+    }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -1016,7 +1009,7 @@ export class CodeArtsAdapter extends LlmAdapter {
         try {
           const timeoutMs = firstTokenReceived ? resolveChunkTimeoutMs() : resolveFirstTokenTimeoutMs()
           const phase = firstTokenReceived ? 'chunk' : 'first-token'
-          const result = await readWithIdleTimeout(reader, timeoutMs, options.signal, phase)
+          const result = await readCodeArtsChunk(reader, timeoutMs, options.signal, phase)
           done = result.done
           value = result.value
           if (!done) firstTokenReceived = true
@@ -1136,7 +1129,12 @@ export class CodeArtsAdapter extends LlmAdapter {
               yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
             }
             if (call.id !== undefined) block.callId = call.id
-            if (call.function?.name !== undefined) block.name = call.function.name
+            // 后续参数分片会带上空的 function.name（""），它不是 undefined，
+            // 直接覆盖会把首个分片解析出的真实工具名清空，导致
+            // `unknown tool ""`。只有非空名字才允许更新。
+            if (typeof call.function?.name === 'string' && call.function.name.length > 0) {
+              block.name = call.function.name
+            }
             const fragment = call.function?.arguments ?? ''
             block.text += fragment
             yield {
@@ -1210,7 +1208,10 @@ export class CodeArtsAdapter extends LlmAdapter {
           type: 'tool-call',
           id: CallId(block.callId ?? ''),
           name: block.name ?? '',
-          arguments: block.text,
+          // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
+          arguments: isTruncatedArguments(block.text)
+            ? block.text
+            : normalizeToolArguments(block.text),
         },
       }
     }

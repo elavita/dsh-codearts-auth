@@ -21,7 +21,8 @@
     "prepare": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:e2e": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts",
+    "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {
