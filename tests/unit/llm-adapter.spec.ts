@@ -67,11 +67,14 @@ describe('CodeArtsAdapter', () => {
   })
 
   it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
-    // GLM-5.2：202752；deepseek-v4-flash/pro：1048576（1M）。
+    // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
+    // deepseek-v4-flash/pro：1048576（1M）。
     // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(glm52.context).toEqual({ contextWindow: 202752 })
+    const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
+    expect(glm53flash.context).toEqual({ contextWindow: 1_048_576 })
     const dsFlash = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
     expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
     const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
@@ -136,6 +139,46 @@ describe('CodeArtsAdapter', () => {
     }
     expect(refreshed).toBe(true)
     expect(texts).toEqual(['ok'])
+  })
+
+  it('listModels advertises glm-5.3-flash with the GLM family', async () => {
+    // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3 Flash
+    // （benefit 免费额度模型，后端注册 id 为全小写 glm-5.3-flash）。
+    const models = await makeAdapter().listModels('codearts')
+    expect(models.map((model) => model.id)).toContain('glm-5.3-flash')
+    // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
+    expect(models[0]!.id).toBe('GLM-5.2')
+  })
+
+  it('signs glm-5.3-flash requests with the maas_type: benefit header', async () => {
+    // glm-5.3-flash 是 benefit（免费额度）模型：maas_type: benefit 必须
+    // 参与 SDK-HMAC-SHA256 签名并随请求发送，否则后端返回
+    // InferHub.002002009.404 "model is not registered"。
+    // （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d。）
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      expect(headers.get('maas_type')).toBe('benefit')
+      const auth = headers.get('Authorization') ?? ''
+      expect(auth).toContain('maas_type')
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const texts: string[] = []
+    for await (const chunk of adapter.stream({ ...streamOptions, model: 'glm-5.3-flash' } as never)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+    expect(texts).toEqual(['ok'])
+  })
+
+  it('does not send maas_type for other models', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      expect(headers.get('maas_type')).toBeNull()
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+    expect(fetchImpl).toHaveBeenCalled()
   })
 
   it('refreshes the credential once when the chat request fails with APIG.0602 and retries successfully', async () => {
@@ -1041,8 +1084,31 @@ describe('CodeArtsAdapter', () => {
       expect(wire.some(message => message.role === 'system' && typeof message.content === 'string'
         && message.content.includes('<｜DSML｜tool_calls>'))).toBe(true)
       // 模型以 DSML 格式输出，适配器从 delta.content 解析。
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="read">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/a.ts</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
       return new Response(
-        'data: {"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\\"read\\"><｜DSML｜parameter name=\\"filePath\\" string=\\"true\\">/tmp/a.ts
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read a file' }],
+      tools: [{
+        name: 'read',
+        description: 'Read a file at the given path.',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string', description: 'Absolute file path' } },
+          required: ['filePath'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
     for await (const chunk of adapter.stream(opts)) {
       if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
         toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })

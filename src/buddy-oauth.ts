@@ -313,7 +313,7 @@ export async function fetchModels(
   credential: BuddyCredential,
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
-): Promise<Array<{ id: string; name: string }>> {
+): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
   if (credential.access_token.length === 0) return []
   const url = `${API_ENDPOINT}${CONFIG_PATH}`
   const headers: Record<string, string> = {

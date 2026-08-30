@@ -73,15 +73,22 @@ dsh plugin --profile <name> install <path-to-this-repo>
 `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2`）。每个模型请求都使用
 存储的 AK/SK/SecurityToken 按华为 `SDK-HMAC-SHA256` 方案签名，并附带
 `Chat-Id`/`Session-Id` 请求头。默认广告的模型为 GLM-5.2、GLM-5.1、
-GLM-5、盘古 openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
+GLM-5、GLM-5.3 Flash（`glm-5.3-flash`，1M 上下文）、盘古
+openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
 以及 DeepSeek V4 deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费
 Tokens 福利）。
 登录后在 dsh Models 页面选择该 provider 即可。
 
-> 注：CodeArts Agent IDE 模型列表显示的 flash ID 为 `deepseek-v4-flash-0731`
+> 注 1：CodeArts Agent IDE 模型列表显示的 flash ID 为 `deepseek-v4-flash-0731`
 > （带日期后缀），但后端实际注册的可用 ID 是 `deepseek-v4-flash`（无后缀）。
 > 用 `deepseek-v4-flash-0731` 调用会返回 `InferHub.002002009.404 The model is
 > not registered`，因此本插件只注册无后缀的 `deepseek-v4-flash`。
+>
+> 注 2：`glm-5.3-flash`（GLM-5.3 Flash，2026-08 加入，1M 上下文）是 benefit
+> （免费额度）模型：其 chat 请求必须携带 `maas_type: benefit` 请求头且该头
+> 参与 `SDK-HMAC-SHA256` 签名，否则后端返回 `InferHub.002002009.404 The model
+> is not registered`。适配器已自动处理，无需手动配置。
+> （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d。）
 
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。

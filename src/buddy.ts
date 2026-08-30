@@ -264,16 +264,38 @@ export function displayNameForModel(id: string): string {
   return MODEL_DISPLAY_NAMES[id] ?? id
 }
 
+/** /v3/config 解析出的单个模型：id、展示名与可选的上下文窗口。 */
+export interface BuddyRemoteModel {
+  id: string
+  name: string
+  /** 上下文窗口（data.models[].maxInputTokens，模型自身配置）；远端未下发时缺省。 */
+  contextWindow?: number
+}
+
 /**
  * 从 /v3/config 响应解析模型列表（craft agent 的 models）。
  *
- * 响应结构：{data: {agents: [{name: "craft", models: ["auto", "hy4-preview", ...]}, ...]}}
+ * 响应结构：{data: {agents: [{name: "craft", models: ["auto", "hy4-preview", ...]}, ...],
+ *                     models: [{id, name, maxInputTokens, maxOutputTokens, ...}]}}
+ * craft agent 的 models 是字符串 id 列表；各模型的上下文窗口从 data.models[].maxInputTokens
+ * 按 id 查找（权威来源，对齐 deveco-code-rust parse_models_from_config）。
  * 排除 "auto"（自动选择，非真实模型）。解析失败时返回空数组，调用方回退内置列表。
  */
-export function parseModelsFromConfig(body: unknown): Array<{ id: string; name: string }> {
+export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   if (typeof body !== 'object' || body === null) return []
   const data = (body as Record<string, unknown>).data
   if (typeof data !== 'object' || data === null) return []
+  // data.models: id → maxInputTokens（仅保留正数，与 Rust 端一致）
+  const contextById = new Map<string, number>()
+  if (Array.isArray((data as Record<string, unknown>).models)) {
+    for (const model of (data as Record<string, unknown>).models as unknown[]) {
+      if (typeof model !== 'object' || model === null) continue
+      const record = model as Record<string, unknown>
+      if (typeof record.id !== 'string') continue
+      const limit = record.maxInputTokens
+      if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) contextById.set(record.id, limit)
+    }
+  }
   const agents = (data as Record<string, unknown>).agents
   if (!Array.isArray(agents)) return []
   for (const agent of agents) {
@@ -282,10 +304,15 @@ export function parseModelsFromConfig(body: unknown): Array<{ id: string; name: 
     if (record.name !== 'craft') continue
     const models = record.models
     if (!Array.isArray(models)) return []
-    const parsed: Array<{ id: string; name: string }> = []
+    const parsed: BuddyRemoteModel[] = []
     for (const model of models) {
       if (typeof model !== 'string' || model === 'auto') continue
-      parsed.push({ id: model, name: displayNameForModel(model) })
+      const contextWindow = contextById.get(model)
+      parsed.push({
+        id: model,
+        name: displayNameForModel(model),
+        ...contextWindow !== undefined ? { contextWindow } : {},
+      })
     }
     return parsed
   }

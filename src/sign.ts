@@ -1,4 +1,4 @@
-/** 华为云 SDK-HMAC-SHA256 请求签名（移植自 deveco-code codearts.ts）。 */
+/** 华为云 SDK-HMAC-SHA256 请求签名 extraHeaders */
 export async function sha256Hex(data: Uint8Array): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', data.slice().buffer as ArrayBuffer)
   return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -32,6 +32,7 @@ export async function signRequestHuawei(
   method: string,
   urlStr: string,
   body: Uint8Array,
+  extraHeaders?: Readonly<Record<string, string>>,
 ): Promise<Map<string, string>> {
   const url = new URL(urlStr)
   let uri = url.pathname
@@ -45,6 +46,12 @@ export async function signRequestHuawei(
   headers.set('x-sdk-date', dateStamp)
   headers.set('x-sdk-content-sha256', payloadHash)
   headers.set('x-security-token', securityToken)
+  // 额外的签名头（如 glm-5.3-flash 的 maas_type: benefit）：与 Rust 参考实现
+  // sign_request_huawei 的 extra_headers 一致，参与 canonical 计算并包含在
+  // SignedHeaders 中，需原样随请求发送，否则服务端验签失败。
+  if (extraHeaders !== undefined) {
+    for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value)
+  }
   // GET 请求（排队状态轮询）不携带请求体，因此无 content-type。
   if (method.toUpperCase() !== 'GET') headers.set('content-type', 'application/json')
 

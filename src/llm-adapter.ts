@@ -21,19 +21,33 @@ export const PROVIDER = 'codearts'
 // 结论：IDE 模型列表显示的 flash ID 与后端实际注册 ID 不一致，使用无后缀的 deepseek-v4-flash。
 const DEFAULT_MODELS: readonly string[] = [
   'GLM-5.2', 'GLM-5.1', 'GLM-5',
+  'glm-5.3-flash',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
   'deepseek-v4-flash', 'deepseek-v4-pro',
 ]
 
-// 模型上下文窗口（最大合并请求+响应 token 数）。
-// - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
-// - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
-// - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+/**
+ * 模型上下文窗口（最大合并请求+响应 token 数）。
+ * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
+ * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
+ * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
+ * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+ */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['GLM-5.2', 202752],
+  ['glm-5.3-flash', 1_048_576],
   ['deepseek-v4-flash', 1048576],
   ['deepseek-v4-pro', 1048576],
 ])
+
+/**
+ * glm-5.3-flash（CodeArts Agent 后端新增模型，2026-08 加入）是 benefit（免费额度）
+ * 模型：chat 请求必须携带 `maas_type: benefit` 请求头且参与 SDK-HMAC-SHA256
+ * 签名，否则后端返回 InferHub.002002009.404 "model is not registered"。
+ * 逆向自 CodeArts Agent IDE mitmproxy 抓包（snap-access/api/v2/chat/completions），
+ * 对齐 deveco-code-rust 90aeb17d（codearts.rs chat_stream signer + e2e 实测）。
+ */
+const MAAS_TYPE_BENEFIT_MODELS: ReadonlySet<string> = new Set(['glm-5.3-flash'])
 
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
@@ -804,6 +818,11 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 同一次 stream() 调用最多 refresh 一次。
     let authRefreshed = false
     for (;;) {
+      // glm-5.3-flash 是 benefit（免费额度）模型，后端要求 maas_type: benefit
+      // 头参与 SDK-HMAC-SHA256 签名，否则返回 InferHub.002002009.404
+      // "model not registered"（逆向自 CodeArts Agent IDE 抓包，见
+      // MAAS_TYPE_BENEFIT_MODELS 注释）。
+      const extraSignedHeaders = MAAS_TYPE_BENEFIT_MODELS.has(options.model) ? { maas_type: 'benefit' } : undefined
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,
@@ -811,8 +830,11 @@ export class CodeArtsAdapter extends LlmAdapter {
         'POST',
         url,
         new TextEncoder().encode(body),
+        extraSignedHeaders,
       )
       const headers = new Headers(attributionHeaders())
+      // 签名 map 中的额外头（如 maas_type）必须随请求发送——它们已参与
+      // canonical 计算、包含在 SignedHeaders 列表中，缺失会导致服务端验签失败。
       signed.forEach((value, key) => { if (key !== 'content-type') headers.set(key, value) })
       headers.set('Content-Type', 'application/json')
       headers.set('Chat-Id', this.chatId)

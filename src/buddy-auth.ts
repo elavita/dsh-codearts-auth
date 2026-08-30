@@ -218,7 +218,7 @@ export class BuddyAuth extends Service {
    * GET /v3/config → 获取远端模型列表（craft agent 的 models）。
    * 失败或未登录时返回空数组（调用方回退到内置列表）。
    */
-  async fetchModels(): Promise<Array<{ id: string; name: string }>> {
+  async fetchModels(): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
     const resolved = await this.ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
     if (!resolved) return []
     const credential = parseCredential(resolved.value)

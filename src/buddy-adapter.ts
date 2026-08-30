@@ -53,23 +53,27 @@ const DEFAULT_MODELS: readonly string[] = [
 /** 默认模型（deepseek-v4-flash，对齐 IDE 默认）。 */
 export const DEFAULT_MODEL = 'deepseek-v4-flash'
 
-/** 模型上下文窗口（对齐 Rust BuddyProvider::context_limit）。 */
+/**
+ * 模型上下文窗口（对齐 Rust BuddyProvider::context_limit 的静态 fallback 表；
+ * 权威来源是 /v3/config data.models[].maxInputTokens，由 fetchRemoteModels
+ * 动态拉取后经 resolveRemoteContextWindow 优先采用，此表仅作远端不可用时的兜底）。
+ */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_000_000],
   ['deepseek-v4-pro', 1_000_000],
-  ['hy4-preview', 192_000],
-  ['hy4-preview-x', 192_000],
+  ['hy4-preview', 1_000_000],
+  ['hy4-preview-x', 1_000_000],
   ['hy3', 192_000],
   ['hy3-x', 192_000],
-  ['glm-5.3', 200_000],
-  ['glm-5.3-flash', 200_000],
-  ['glm-5.2', 200_000],
+  ['glm-5.3', 1_000_000],
+  ['glm-5.3-flash', 1_000_000],
+  ['glm-5.2', 1_000_000],
   ['glm-5.1', 200_000],
   ['glm-5v-turbo', 200_000],
-  ['kimi-k3-1', 200_000],
-  ['kimi-k2.7', 200_000],
-  ['kimi-k2.6', 200_000],
-  ['minimax-m3', 200_000],
+  ['kimi-k3-1', 1_000_000],
+  ['kimi-k2.7', 256_000],
+  ['kimi-k2.6', 256_000],
+  ['minimax-m3', 512_000],
 ])
 
 export interface BuddyAdapterOptions {
@@ -78,8 +82,8 @@ export interface BuddyAdapterOptions {
   resolveCredential: () => Promise<BuddyCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
-  /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  /** 动态拉取远端模型列表（含上下文窗口，若远端下发）；失败时调用方回退到静态列表。 */
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
   fetchImpl?: typeof fetch
 }
 
@@ -252,6 +256,8 @@ export class BuddyAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: Array<{ id: string; name: string }> | undefined
+  /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
+  private remoteContextWindows: ReadonlyMap<string, number> = new Map()
 
   constructor(private readonly options: BuddyAdapterOptions) {
     super()
@@ -266,26 +272,45 @@ export class BuddyAdapter extends LlmAdapter {
    * 模型列表：优先使用 /v3/config 动态拉取的远端列表，否则回退静态默认。
    * 动态拉取失败时静默回退（与 Rust fetch_models 的 Vec::new() 语义一致）。
    */
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    if (this.remoteModels === undefined && this.options.fetchRemoteModels !== undefined) {
-      try {
-        const models = await this.options.fetchRemoteModels()
-        if (models.length > 0) this.remoteModels = models
-      } catch {
-        // 远端不可用：回退静态列表
+  /**
+   * 懒加载远端模型目录（仅拉取一次）。listModels 与 resolveModel 共用：
+   * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
+   * 触发一次远端拉取，保证 /v3/config 的 maxInputTokens 能生效。
+   */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+    try {
+      const models = await this.options.fetchRemoteModels()
+      if (models.length > 0) {
+        this.remoteModels = models
+        // /v3/config data.models[].maxInputTokens 是权威来源（对齐 Rust
+        // TUI buddy_context_limits 注入逻辑）：远端下发的上下文窗口优先
+        // 于 CONTEXT_WINDOWS 静态 fallback 表。
+        this.remoteContextWindows = new Map(
+          models.filter((model) => model.contextWindow !== undefined).map((model) => [model.id, model.contextWindow as number]),
+        )
       }
+    } catch {
+      // 远端不可用：回退静态列表
     }
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
     return source.map((model) => ({
       provider: PROVIDER, id: model.id, name: model.name, inputModalities: ['text'],
     }))
   }
 
-  resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const contextWindow = CONTEXT_WINDOWS.get(model)
+  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    await this.ensureRemoteModels()
+    // 优先远端 maxInputTokens，其次静态 fallback 表（对齐 Rust
+    // context_limit_for_model 的两级查找）。
+    const contextWindow = this.remoteContextWindows.get(model) ?? CONTEXT_WINDOWS.get(model)
     const resolved: LlmResolvedModelInfo = { provider, id: model, name: model }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
-    return Promise.resolve(resolved)
+    return resolved
   }
 
   /**
