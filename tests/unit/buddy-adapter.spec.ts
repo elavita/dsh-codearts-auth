@@ -43,7 +43,7 @@ function makeAdapter(overrides: {
   /** refresh() 之后 resolveCredential 应返回的值；默认刷新成功（恢复为有效凭据）。 */
   postRefreshCredential?: BuddyCredential | undefined
   fetchImpl?: typeof fetch
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -100,6 +100,36 @@ describe('BuddyAdapter', () => {
     expect(resolved).toMatchObject({ provider: 'buddy', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
   })
 
+  it('resolveModel matches the Rust fallback table for glm and hy models', async () => {
+    // 对齐 deveco-code-rust BuddyProvider::context_limit 静态 fallback：
+    // glm-5.3-flash 1M（此前误配 200k，导致 web 上下文表显示 ~200K）。
+    const adapter = makeAdapter()
+    expect((await adapter.resolveModel('buddy', 'glm-5.3-flash')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy', 'glm-5.3')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy', 'glm-5.2')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy', 'glm-5.1')).context).toEqual({ contextWindow: 200_000 })
+    expect((await adapter.resolveModel('buddy', 'minimax-m3')).context).toEqual({ contextWindow: 512_000 })
+    expect((await adapter.resolveModel('buddy', 'kimi-k2.6')).context).toEqual({ contextWindow: 256_000 })
+  })
+
+  it('resolveModel prefers the remote maxInputTokens over the static table', async () => {
+    // /v3/config data.models[].maxInputTokens 是权威来源（对齐 Rust
+    // context_limit_for_model 两级查找）：远端下发值覆盖静态 fallback。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 }],
+    })
+    const resolved = await adapter.resolveModel('buddy', 'glm-5.3-flash')
+    expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
+  })
+
+  it('resolveModel falls back to the static table when the remote value is absent', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash' }],
+    })
+    const resolved = await adapter.resolveModel('buddy', 'glm-5.3-flash')
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
+  })
+
   it('resolveModel omits context for unknown models', async () => {
     const resolved = await makeAdapter().resolveModel('buddy', 'unknown-model')
     expect(resolved.context).toBeUndefined()
@@ -116,7 +146,7 @@ describe('BuddyAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'buddy',
       id: 'hy4-preview',
-      context: { contextWindow: 192_000 },
+      context: { contextWindow: 1_000_000 },
       inputModalities: ['text'],
     })
     expect(typeof call.stream).toBe('function')

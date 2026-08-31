@@ -22,6 +22,7 @@ function makeAdapter(overrides: {
   credential?: CodeArtsCredential | undefined
   refresh?: () => Promise<void>
   fetchImpl?: typeof fetch
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : validCredential
   const refresh = overrides.refresh ?? (async () => {})
@@ -31,6 +32,7 @@ function makeAdapter(overrides: {
     resolveCredential: async () => credential,
     refresh: async () => { await refresh(); credential = validCredential },
     fetchImpl,
+    fetchRemoteModels: overrides.fetchRemoteModels,
   })
   return adapter
 }
@@ -625,6 +627,26 @@ describe('CodeArtsAdapter', () => {
     } as never
     for await (const _ of adapter.stream(opts)) { /* drain */ }
     expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  it('hides vision-only (VL) models from listModels so they cannot be used as the agent model', async () => {
+    // VL 多模态模型（如 Qwen3-VL-235B）上下文小、不支持工具调用，不适合当
+    // agent 主模型，从模型列表屏蔽。它们只通过 analyzeImage 工具间接调用。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2' },
+        { id: 'Qwen3-VL-235B', name: 'Qwen3-VL-235B' },
+        { id: 'Qwen3.6-27B-VL', name: 'Qwen3.6-27B-VL' },
+        { id: 'Qwen3.5-397B-A17B-VL', name: 'Qwen3.5-397B-A17B-VL' },
+      ],
+    })
+    const models = await adapter.listModels('codearts')
+    const ids = models.map((m) => m.id)
+    expect(ids).not.toContain('Qwen3-VL-235B')
+    expect(ids).not.toContain('Qwen3.6-27B-VL')
+    expect(ids).not.toContain('Qwen3.5-397B-A17B-VL')
+    // 普通模型不受影响。
+    expect(ids).toContain('GLM-5.2')
   })
 
   it('switches deepseek-v4 to DSML tool mode: no tools field, schema injected into system', async () => {

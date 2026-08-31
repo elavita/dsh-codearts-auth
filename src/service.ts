@@ -9,6 +9,12 @@ import {
 } from './oauth.js'
 import { RefreshScheduler } from './refresh.js'
 import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult } from './types.js'
+import {
+  fetchCodeArtsRemoteModels,
+  MODEL_REFRESH_INTERVAL_MS,
+  saveModelsCache,
+  setMemoryCache,
+} from './models.js'
 
 /** CodeArts 登录结果存储所用的凭据引用。 */
 export const CODEARTS_CREDENTIAL_REF = 'CODEARTS_ACCESS_TOKEN'
@@ -71,6 +77,10 @@ export class CodeArtsAuth extends Service {
   private lastRefreshError: string | undefined
   /** 登录会话是否仍处于活跃状态；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
   private active = true
+  /** 远端模型列表定时刷新定时器。 */
+  private modelRefreshTimer: ReturnType<typeof setInterval> | undefined
+  /** 用于测试的可注入 fetch；默认为全局 fetch。 */
+  private fetchImpl: typeof fetch = fetch
 
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。 */
   private markRefreshTokenInvalid(): void {
@@ -94,6 +104,7 @@ export class CodeArtsAuth extends Service {
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
     this.scheduleRefresh()
+    void this.refreshModels()
     const credential = parseCredential(flow.access)
     return {
       access: flow.access,
@@ -168,13 +179,15 @@ export class CodeArtsAuth extends Service {
     // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
     this.active = false
     this.scheduler.stop()
+    this.stopModelRefresh()
     await this.ctx.credentials.unset(credentialRef(CODEARTS_CREDENTIAL_REF))
   }
 
-  /** 停止刷新调度（不清理凭据）。 */
+  /** 停止刷新调度与模型刷新定时器（不清理凭据）。 */
   stop(): void {
     this.active = false
     this.scheduler.stop()
+    this.stopModelRefresh()
   }
 
   /** 启动时若已有可刷新凭据则安排续期（由 apply 调用）。 */
@@ -188,6 +201,40 @@ export class CodeArtsAuth extends Service {
     })
   }
 
-  /** 用于测试的可注入 fetch；默认为全局 fetch。 */
-  private fetchImpl: typeof fetch = fetch
+  /** 启动时若已有可刷新凭据则安排模型刷新（由 apply 调用）。 */
+  scheduleModelRefresh(): void {
+    this.stopModelRefresh()
+    void this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF)).then((resolved) => {
+      if (!resolved) return
+      const credential = parseCredential(resolved.value)
+      if (!credential?.access_key_id || !credential?.secret_access_key) return
+      void this.refreshModels()
+      this.modelRefreshTimer = setInterval(() => void this.refreshModels(), MODEL_REFRESH_INTERVAL_MS)
+      if (this.modelRefreshTimer?.unref) this.modelRefreshTimer.unref()
+    })
+  }
+
+  /** 停止模型刷新定时器。 */
+  stopModelRefresh(): void {
+    if (this.modelRefreshTimer !== undefined) {
+      clearInterval(this.modelRefreshTimer)
+      this.modelRefreshTimer = undefined
+    }
+  }
+
+  /** 用当前凭据从远端拉取模型列表，非空时更新内存缓存与磁盘。返回模型列表（可能为空）。 */
+  async refreshModels(): Promise<Array<{ id: string; name: string }>> {
+    if (!this.active) return []
+    const resolved = await this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
+    if (!resolved) return []
+    const credential = parseCredential(resolved.value)
+    if (!credential?.access_key_id || !credential?.secret_access_key) return []
+    const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl)
+    if (models.length > 0) {
+      setMemoryCache(models)
+      saveModelsCache(models)
+    }
+    return models
+  }
+
 }

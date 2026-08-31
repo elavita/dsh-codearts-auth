@@ -53,6 +53,8 @@ export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
+  /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
@@ -711,15 +713,41 @@ export class CodeArtsAdapter extends LlmAdapter {
     return { id: provider, name: 'CodeArts Agent' }
   }
 
-  listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(DEFAULT_MODELS.map((id) => ({ provider: PROVIDER, id, name: id, inputModalities: ['text'] })))
+  /** 动态模型缓存（首次 listModels 成功后填充）。 */
+  private remoteModels: Array<{ id: string; name: string }> | undefined
+
+  /**
+   * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
+   * （如直接进入会话），此时同样触发远端拉取。
+   */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+    try {
+      const models = await this.options.fetchRemoteModels()
+      if (models.length > 0) this.remoteModels = models
+    } catch {
+      // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态列表
+    }
   }
 
-  resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    void this.ensureRemoteModels()
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // 屏蔽视觉（VL）多模态模型（id 含 -VL- 或以 -VL 结尾，如 Qwen3-VL-235B）：
+    // 这类模型上下文小（32768 tokens）、不支持工具调用（vLLM 未启用
+    // auto-tool-choice，发 tools 会 400），不适合当 agent 主模型，故从列表隐藏。
+    const visible = source.filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+    return Promise.resolve(visible.map((m) => ({ provider: PROVIDER, id: m.id, name: m.name, inputModalities: ['text'] as const })))
+  }
+
+  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    await this.ensureRemoteModels()
+    const remoteModel = this.remoteModels?.find((m) => m.id === model)
+    const name = remoteModel?.name ?? model
     const contextWindow = CONTEXT_WINDOWS.get(model)
-    const resolved: LlmResolvedModelInfo = { provider, id: model, name: model }
+    const resolved: LlmResolvedModelInfo = { provider, id: model, name }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
-    return Promise.resolve(resolved)
+    return resolved
   }
 
   async prepareCall(

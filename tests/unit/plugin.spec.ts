@@ -13,7 +13,11 @@ vi.mock('../../src/login.js', () => ({
 }))
 
 // Buddy 登录会真实发起轮询网络请求：插件层测试只关心命令/路由注册，故 mock 整个流程。
-vi.mock('../../src/buddy-oauth.js', () => ({
+// RefreshTokenExpiredError 必须保留真实实现：buddy-auth 的 RefreshScheduler
+// onError 回调以 `error instanceof RefreshTokenExpiredError` 判定续期是否
+// 彻底失效；mock 缺少该导出会让判定路径抛出 unhandled rejection。
+vi.mock('../../src/buddy-oauth.js', async (importOriginal) => ({
+  ...await importOriginal(),
   runBuddyLoginFlow: vi.fn(),
 }))
 

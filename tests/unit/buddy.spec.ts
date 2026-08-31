@@ -143,6 +143,26 @@ describe('buddy model config parsing', () => {
     ])
   })
 
+  it('attaches maxInputTokens from data.models as contextWindow', () => {
+    // /v3/config data.models[].maxInputTokens 是模型上下文窗口的权威来源
+    // （对齐 deveco-code-rust parse_models_from_config）。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['auto', 'glm-5.3-flash', 'kimi-k2.6', 'unknown-model'] }],
+        models: [
+          { id: 'glm-5.3-flash', maxInputTokens: 1048576 },
+          { id: 'kimi-k2.6', maxInputTokens: 262144 },
+          { id: 'bad-entry', maxInputTokens: 0 },
+        ],
+      },
+    })
+    expect(models).toEqual([
+      { id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 },
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144 },
+      { id: 'unknown-model', name: 'unknown-model' },
+    ])
+  })
+
   it('returns an empty list for malformed payloads', () => {
     expect(parseModelsFromConfig(null)).toEqual([])
     expect(parseModelsFromConfig({})).toEqual([])
