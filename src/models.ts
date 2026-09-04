@@ -8,10 +8,12 @@ import type { CodeArtsCredential } from './types.js'
 export const OPENGW_GATEWAY_CONFIG_URL = 'https://opengw.developer.huaweicloud.com/api/v1/gateway/config'
 
 /**
- * snap-access 统计端点 — 返回常规模型列表（GLM-5.2 等，model_metrics 字段）。
- * 逆向自 CodeArts Agent IDE mitmproxy 抓包（2026-08）。
+ * snap-access 内置模型列表端点 — 返回常规模型（GLM-5.2、openpangu、glm-5.2-sft-harmony 等）。
+ * 响应结构：{ count, builtinModels: [{ model_id, model_name, ... }] }。
+ * 用 AK/SK 签名 + Agent-Type: PromptCenter header。
+ * 替代旧 SNAP_STATISTICS_URL（statistics/plugin 已不再返回 model_metrics）。
  */
-export const SNAP_STATISTICS_URL = 'https://snap-access.cn-north-4.myhuaweicloud.com/snap-manager/v1/statistics/plugin'
+export const SNAP_MODEL_BUILTIN_URL = 'https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin'
 
 /** 远端动态模型列表缓存文件名（~/.cache/deveco/codearts_models.json）。 */
 const CODEARTS_MODELS_CACHE_FILENAME = 'codearts_models.json'
@@ -50,6 +52,10 @@ function parseModelInfo(m: Record<string, unknown>, seen: Set<string>): RemoteMo
   const rawId = m['model_id']
   if (typeof rawId !== 'string' || rawId.length === 0) return undefined
   const id = normalizeModelId(rawId)
+  // 过滤视觉（VL）多模态模型
+  // id 含 -VL- 或以 -VL 结尾（如 Qwen3-VL-235B），上下文小、不支持工具调用，
+  // 不适合当 agent 主模型，从列表隐藏；只通过 analyzeImage 等工具间接调用。
+  if (id.includes('-VL-') || id.endsWith('-VL')) return undefined
   const rawName = m['model_name']
   const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id
   if (seen.has(id)) return undefined
@@ -81,12 +87,17 @@ async function fetchSignedGet(
   ak: string,
   sk: string,
   st: string,
+  /** 签名后追加的头（不参与 SDK-HMAC-SHA256 签名计算）。 */
+  extraUnsignedHeaders?: Readonly<Record<string, string>>,
 ): Promise<string | undefined> {
   const signed = await signRequestHuawei(ak, sk, st, 'GET', url, new Uint8Array())
   const headers = new Headers()
   signed.forEach((v, k) => {
     if (k !== 'host') headers.set(k, v)
   })
+  if (extraUnsignedHeaders !== undefined) {
+    for (const [k, v] of Object.entries(extraUnsignedHeaders)) headers.set(k, v)
+  }
   try {
     const response = await fetcher(url, {
       method: 'GET',
@@ -103,7 +114,7 @@ async function fetchSignedGet(
 /**
  * 从两个远端端点拉取模型列表并合并去重：
  * 1. opengw gateway/config → result.models（benefit 模型）
- * 2. snap-access statistics/plugin → model_metrics（常规模型）
+ * 2. snap-access /v1/model/builtin → builtinModels（常规模型）
  * 失败或空凭据时返回空数组（不阻断）。
  */
 export async function fetchCodeArtsRemoteModels(
@@ -130,10 +141,16 @@ export async function fetchCodeArtsRemoteModels(
     }
   }
 
-  // 2. snap-access statistics/plugin — 常规模型（GLM-5.2 等）
-  const snapText = await fetchSignedGet(fetcher, SNAP_STATISTICS_URL, ak, sk, st)
+  // 2. snap-access /v1/model/builtin — 常规模型（GLM-5.2、openpangu、glm-5.2-sft-harmony 等）
+  //    Agent-Type: PromptCenter + X-Language: zh-cn（不参与签名）。
+  //    替代旧 statistics/plugin（已不再返回 model_metrics）。
+  const snapText = await fetchSignedGet(fetcher, SNAP_MODEL_BUILTIN_URL, ak, sk, st, {
+    'Content-Type': 'application/json',
+    'Agent-Type': 'PromptCenter',
+    'X-Language': 'zh-cn',
+  })
   if (snapText !== undefined) {
-    const arr = extractJsonArray(snapText, ['model_metrics'])
+    const arr = extractJsonArray(snapText, ['builtinModels'])
     if (arr !== undefined) {
       for (const item of arr) {
         if (typeof item === 'object' && item !== null) {
