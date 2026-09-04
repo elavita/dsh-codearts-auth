@@ -1,10 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
-  attributionHeaders, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
+  attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
   isQuotaExceededError, LlmAdapter, LlmError, QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { signRequestHuawei } from './sign.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -1023,7 +1024,7 @@ export class CodeArtsAdapter extends LlmAdapter {
           index: nextIndex++,
           text: call.arguments,
           name: call.name,
-          callId: CallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+          callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
         }
         toolCalls.set(wireIndex, block)
         toolOrder.push(block.index)
@@ -1155,7 +1156,7 @@ export class CodeArtsAdapter extends LlmAdapter {
                 index: nextIndex++,
                 text: call.arguments,
                 name: call.name,
-                callId: CallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+                callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
               }
               toolCalls.set(wireIndex, block)
               toolOrder.push(block.index)
@@ -1190,7 +1191,7 @@ export class CodeArtsAdapter extends LlmAdapter {
             yield {
               type: 'tool-call-delta',
               index: block.index,
-              id: CallId(block.callId ?? ''),
+              id: ToolCallId(block.callId ?? ''),
               ...block.name !== undefined ? { name: block.name } : {},
               argumentsDelta: fragment,
             }
@@ -1256,7 +1257,7 @@ export class CodeArtsAdapter extends LlmAdapter {
         index,
         block: {
           type: 'tool-call',
-          id: CallId(block.callId ?? ''),
+          id: ToolCallId(block.callId ?? ''),
           name: block.name ?? '',
           // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
           arguments: isTruncatedArguments(block.text)

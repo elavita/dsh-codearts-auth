@@ -11,9 +11,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
-  attributionHeaders, CallId,
+  attributionHeaders,
   LlmAdapter, LlmError,
 } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   API_DOMAIN,
@@ -551,7 +552,7 @@ export class BuddyAdapter extends LlmAdapter {
             yield {
               type: 'tool-call-delta',
               index: block.index,
-              id: CallId(callId),
+              id: ToolCallId(callId),
               ...block.name !== undefined ? { name: block.name } : {},
               argumentsDelta: fragment,
             }
@@ -580,7 +581,7 @@ export class BuddyAdapter extends LlmAdapter {
         index,
         block: {
           type: 'tool-call',
-          id: CallId(block.callId ?? ''),
+          id: ToolCallId(block.callId ?? ''),
           name: block.name ?? '',
           // 仅把"无参数工具下发的空分片"补成 {}；**残缺参数保持原样**，
           // 由 max-tokens 判定触发重试。切勿把残缺 JSON 也补成 {}——那会
