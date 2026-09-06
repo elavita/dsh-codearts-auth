@@ -483,6 +483,20 @@ function tryParseScalar(value: string): unknown {
   if (trimmed === 'null') return null
   if (trimmed === 'true') return true
   if (trimmed === 'false') return false
+  // 带引号的 JSON 字符串字面量：deepseek-v4-pro 常把数字/布尔参数值用
+  // JSON 字符串编码（如 "840"），即便标记了 string="true" 也只输出引号
+  // 包裹的字面量。先 JSON.parse 解码去掉外层引号，再递归尝试标量转换：
+  // "840" → 840(number)、"true" → true(boolean)、"hello" → "hello"(string)。
+  // 仅当整体是合法 JSON 字符串字面量（"..." 配对）时才解码，避免误伤
+  // 含引号的普通文本（如路径中的引号片段）。flash 模型输出纯数字字面量
+  // 不带引号，不会进入此分支；pro 模型带引号才命中，故 pro 出错多。
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const decoded = JSON.parse(trimmed) as unknown
+      if (typeof decoded === 'string') return tryParseScalar(decoded)
+      return decoded
+    } catch { /* 非合法 JSON 字符串字面量，按原样处理 */ }
+  }
   // 整数 / 浮点数 / 负数：仅当整体匹配数字语法时才转换，避免误伤路径
   // 中的数字片段（如 "v1.2" 不含；"123abc" 不含）。
   if (/^-?\d+$/.test(trimmed)) return Number(trimmed)
@@ -528,7 +542,15 @@ function parseDsmlInvoke(block: string): { name: string; arguments: string } | u
       const parsed = tryParseScalar(value)
       params[paramName] = parsed
     } else {
-      try { params[paramName] = JSON.parse(value) } catch { params[paramName] = value }
+      // 非 string 参数理论上应是 number/array/object/boolean。但
+      // deepseek-v4-pro 有时把数字参数值用 JSON 字符串引号包裹（如 "840"）
+      // 且不加 string="true"：JSON.parse('"840"') 得到字符串 "840"，
+      // schema 校验仍报 "offset" must be a number。对 JSON.parse 得到的
+      // 字符串结果再走一次 tryParseScalar，把数字字面量还原为 number。
+      try {
+        const parsed = JSON.parse(value)
+        params[paramName] = typeof parsed === 'string' ? tryParseScalar(parsed) : parsed
+      } catch { params[paramName] = value }
     }
     cursor = closeStart + DSML_PARAM_CLOSE.length
   }

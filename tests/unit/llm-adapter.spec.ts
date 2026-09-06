@@ -999,6 +999,109 @@ describe('CodeArtsAdapter', () => {
     expect(typeof args.limit).toBe('number')
   })
 
+  it('coerces quoted numeric DSML string params (offset string="true" value "840", pro quirk) to number', async () => {
+    // 实测 deepseek-v4-pro：pro 模型常把数字参数值用 JSON 字符串引号包裹
+    // 输出（如 "840"），即便标记了 string="true"。旧实现 tryParseScalar
+    // 不处理带引号的字面量——"840"（含引号字符）不匹配数字正则、保持
+    // 字符串，schema 校验报 "offset" must be a number。flash 输出纯数字
+    // 不带引号故不受影响，这是 pro 出错多、flash 不出错的根因。修复后
+    // tryParseScalar 先 JSON.parse 解码外层引号再递归标量转换。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="read">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/big.ts</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="offset" string="true">"840"</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="limit" string="true">"40"</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'read big file' }],
+      tools: [{
+        name: 'read',
+        description: 'Read a file',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string' },
+            offset: { type: 'number' },
+            limit: { type: 'number' },
+          },
+          required: ['filePath'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    const args = JSON.parse(toolCallBlocks[0].arguments) as { filePath: string; offset: number; limit: number }
+    expect(args.filePath).toBe('/tmp/big.ts')
+    expect(args.offset).toBe(840)
+    expect(typeof args.offset).toBe('number')
+    expect(args.limit).toBe(40)
+    expect(typeof args.limit).toBe('number')
+  })
+
+  it('coerces quoted numeric DSML params without string attr (pro quirk) to number', async () => {
+    // deepseek-v4-pro 另一种形态：数字参数不加 string="true"，但值仍用
+    // JSON 字符串引号包裹（"840"）。走非 string 路径 JSON.parse('"840"')
+    // 得到字符串 "840"，旧实现直接使用导致 schema 校验失败。修复后非
+    // string 路径对 JSON.parse 得到的字符串结果再走 tryParseScalar 还原。
+    const fetchImpl = vi.fn(async () => {
+      const dsml = '<｜DSML｜tool_calls><｜DSML｜invoke name="read">'
+        + '<｜DSML｜parameter name="filePath" string="true">/tmp/big.ts</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="offset">"840"</｜DSML｜parameter>'
+        + '<｜DSML｜parameter name="limit">"40"</｜DSML｜parameter>'
+        + '</｜DSML｜invoke></｜DSML｜tool_calls>'
+      return new Response(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+    const opts = {
+      provider: 'codearts',
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'read big file' }],
+      tools: [{
+        name: 'read',
+        description: 'Read a file',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string' },
+            offset: { type: 'number' },
+            limit: { type: 'number' },
+          },
+          required: ['filePath'],
+        },
+      }],
+      signal: new AbortController().signal,
+    } as never
+    for await (const chunk of adapter.stream(opts)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        toolCallBlocks.push({ name: chunk.block.name, arguments: chunk.block.arguments })
+      }
+    }
+    expect(toolCallBlocks).toHaveLength(1)
+    const args = JSON.parse(toolCallBlocks[0].arguments) as { filePath: string; offset: number; limit: number }
+    expect(args.offset).toBe(840)
+    expect(typeof args.offset).toBe('number')
+    expect(args.limit).toBe(40)
+    expect(typeof args.limit).toBe('number')
+  })
+
   it('coerces array-looking DSML string params (todos string="true") to array', async () => {
     // 实测 session-59e52486 turn1 step3：deepseek-v4 对 todo_write 的 todos
     // 数组参数误标 string="true"，把 JSON 编码的数组当作字符串输出。旧实现
