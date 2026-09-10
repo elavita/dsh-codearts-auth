@@ -79,6 +79,8 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
 
 export interface BuddyAdapterOptions {
   credentialRef: CredentialRef
+  /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
+  sessionId?: string
   /** 从凭据存储解析凭据。 */
   resolveCredential: () => Promise<BuddyCredential | undefined>
   /** 静默续期凭据。 */
@@ -255,6 +257,11 @@ function isTransportError(error: unknown): boolean {
 /** buddy (腾讯 CodeBuddy) 模型适配器。使用 Bearer access_token 鉴权。 */
 export class BuddyAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
+  /**
+   * 前缀缓存会话标识（prompt_cache_key）。同一会话内所有请求复用同一 key，
+   * 服务端据此把相同前缀的 KV 缓存跨请求复用；缺失时缓存命中恒为 0。
+   */
+  private readonly sessionId: string
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: Array<{ id: string; name: string }> | undefined
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -263,6 +270,7 @@ export class BuddyAdapter extends LlmAdapter {
   constructor(private readonly options: BuddyAdapterOptions) {
     super()
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -362,6 +370,13 @@ export class BuddyAdapter extends LlmAdapter {
       model: options.model,
       messages,
       stream: true,
+      // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回缓存命中，
+      // 缺少该字段时命中恒为 0（与 codearts 同款修复，见 llm-adapter.ts）。
+      // 实证（2026 实测 deepseek-v4-flash，同一段 8k token 前缀）：
+      //   不带该字段 → prompt_tokens=8027, prompt_cache_hit_tokens=0,    credit=0.34
+      //   带该字段   → prompt_tokens=8027, prompt_cache_hit_tokens=7808, credit=0.02
+      // 仅此一个字段的差异，费用差约 17 倍。同 key 重复请求稳定命中同一前缀。
+      prompt_cache_key: this.sessionId,
     }
     if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
@@ -492,7 +507,20 @@ export class BuddyAdapter extends LlmAdapter {
               }
               finish_reason?: string
             }>
-            usage?: Record<string, number>
+            usage?: {
+              prompt_tokens?: number
+              completion_tokens?: number
+              /** 缓存命中的 prompt token 数（与 prompt_cache_hit_tokens 同值）。 */
+              prompt_tokens_details?: {
+                cached_tokens?: number
+                cache_write_tokens?: number
+              }
+              completion_tokens_details?: { reasoning_tokens?: number }
+              prompt_cache_hit_tokens?: number
+              prompt_cache_miss_tokens?: number
+              /** 费用权重（非 token 数）。 */
+              credit?: number
+            }
           }
           try {
             data = JSON.parse(payload)
@@ -558,11 +586,25 @@ export class BuddyAdapter extends LlmAdapter {
             }
           }
           if (data.usage) {
+            const promptTokens = data.usage.prompt_tokens ?? 0
+            // 后端在六处回传缓存信息，其中 cached_tokens 同时出现在
+            // prompt_tokens_details 与 completion_tokens_details 里，但后者
+            // **恒为 0**（实测）——只认 prompt_tokens_details，误取会永远读到 0。
+            const cachedTokens = data.usage.prompt_tokens_details?.cached_tokens
+              ?? data.usage.prompt_cache_hit_tokens
+              ?? 0
+            const cacheWriteTokens = data.usage.prompt_tokens_details?.cache_write_tokens
+            const reasoningTokens = data.usage.completion_tokens_details?.reasoning_tokens
             yield {
               type: 'usage',
               usage: {
-                inputTokens: data.usage.prompt_tokens ?? 0,
+                // 与 codearts 一致：inputTokens 只计**未命中缓存**的部分，
+                // 命中部分单列 cacheReadTokens，否则缓存命中率显示会偏大。
+                inputTokens: cachedTokens > 0 ? promptTokens - cachedTokens : promptTokens,
                 outputTokens: data.usage.completion_tokens ?? 0,
+                ...cachedTokens > 0 ? { cacheReadTokens: cachedTokens } : {},
+                ...cacheWriteTokens !== undefined && cacheWriteTokens > 0 ? { cacheWriteTokens } : {},
+                ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
               },
             }
           }
