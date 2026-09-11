@@ -72,6 +72,8 @@ export interface BuddyLoginFlowOptions {
   timeoutMs?: number
   /** 轮询间隔（毫秒）；默认为 1 秒。 */
   pollIntervalMs?: number
+  /** 已有的 auth state（跳过 fetchAuthState，直接使用此 state 轮询 token）。 */
+  state?: string
 }
 
 /** 从 JSON 响应体读取错误码。 */
@@ -348,6 +350,9 @@ async function defaultOpenBrowser(url: string): Promise<void> {
 /**
  * 完整登录流程：fetchAuthState → 打开浏览器 → 轮询 token → 轮询 account。
  *
+ * 当 options.state 已提供时，跳过 fetchAuthState（用于 RPC 场景：
+ * 由调用方先获取 state+authUrl 返回给客户端弹窗，后台用同一 state 轮询）。
+ *
  * 返回序列化后的凭据 JSON；持久化由调用方（BuddyAuth 服务）负责，
  * 与 CodeArts 的 runOAuthFlow 保持一致的分层。
  */
@@ -355,8 +360,17 @@ export async function runBuddyLoginFlow(options: BuddyLoginFlowOptions = {}): Pr
   const fetcher = options.fetcher ?? fetch
   const open = options.openBrowser ?? defaultOpenBrowser
 
-  const { state, authUrl } = await fetchAuthState(fetcher)
-  await open(authUrl)
+  let state: string
+  let authUrl: string
+  if (options.state) {
+    state = options.state
+    authUrl = ''
+  } else {
+    const result = await fetchAuthState(fetcher)
+    state = result.state
+    authUrl = result.authUrl
+    await open(authUrl)
+  }
 
   const pollOptions = {
     fetcher,

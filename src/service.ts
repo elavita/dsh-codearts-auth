@@ -8,7 +8,8 @@ import {
   keyPairFromStoredJwk,
 } from './oauth.js'
 import { RefreshScheduler } from './refresh.js'
-import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult } from './types.js'
+import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult, ProviderAccountEntry } from './types.js'
+import { AccountPool } from './account-pool.js'
 import {
   fetchCodeArtsRemoteModels,
   MODEL_REFRESH_INTERVAL_MS,
@@ -94,9 +95,9 @@ export class CodeArtsAuth extends Service {
   }
 
   /** 运行登录流程（默认新式 OAuth；flow: 'ticket' 走旧流程回退）并持久化凭据。 */
-  async login(options: { flow?: 'oauth' | 'ticket' } & LoginFlowOptions = {}): Promise<LoginResult> {
+  async login(options: { flow?: 'oauth' | 'ticket'; refName?: string; accountId?: string; pool?: AccountPool } & LoginFlowOptions = {}): Promise<LoginResult> {
     this.active = true
-    const ref = credentialRef(CODEARTS_CREDENTIAL_REF)
+    const ref = options.refName ? credentialRef(options.refName) : credentialRef(CODEARTS_CREDENTIAL_REF)
     const flow: LoginFlowResult = options.flow === 'ticket'
       ? await runLoginFlow(options)
       : await runOAuthFlow(options)
@@ -106,6 +107,20 @@ export class CodeArtsAuth extends Service {
     this.scheduleRefresh()
     void this.refreshModels()
     const credential = parseCredential(flow.access)
+    // 多账号：accountId 提供时自动注册到 pool
+    if (options.accountId && options.pool) {
+      const expiresAt = credential?.expires_at ? Date.parse(credential.expires_at) : undefined
+      await options.pool.addAccount({
+        id: options.accountId,
+        provider: 'codearts',
+        nickname: options.accountId,
+        enabled: true,
+        credentialRef: options.refName ?? CODEARTS_CREDENTIAL_REF,
+        createdAt: Date.now(),
+        expiresAt: Number.isNaN(expiresAt) ? undefined : expiresAt,
+        refreshable: Boolean(credential?.refresh_token),
+      })
+    }
     return {
       access: flow.access,
       expires: flow.expires,
@@ -171,6 +186,59 @@ export class CodeArtsAuth extends Service {
       // 供 /codearts-status 展示 refreshable: false 与重新登录提示。
       if (error instanceof RefreshTokenExpiredError) this.markRefreshTokenInvalid()
       throw error
+    }
+  }
+
+  /**
+   * 批量续期所有 codearts 账号。
+   * 遍历 pool 中 enabled + refreshable 的 codearts 账号，逐一续期。
+   * 单账号失败不影响其他账号。
+   */
+  async refreshAll(pool: AccountPool): Promise<void> {
+    const accounts = await pool.listAccounts('codearts')
+    for (const entry of accounts) {
+      if (!entry.enabled || !entry.refreshable) continue
+      try {
+        const ref = credentialRef(entry.credentialRef)
+        const resolved = await this.ctx.credentials.resolve(ref)
+        if (!resolved) {
+          // 凭据缺失：标记不可续期
+          await pool.updateAccount(entry.id, { refreshable: false })
+          continue
+        }
+        const credential = parseCredential(resolved.value)
+        if (!credential?.refresh_token || !credential.code_verifier || !credential.dpop_private_key_jwk) {
+          await pool.updateAccount(entry.id, { refreshable: false })
+          continue
+        }
+        const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
+        const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
+        const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+        // 保留无变化字段
+        refreshed.domain_id = credential.domain_id
+        refreshed.user_id = credential.user_id
+        refreshed.user_name = credential.user_name
+        // 保留模型重置时间
+        if (credential.model_rate_limits) {
+          refreshed.model_rate_limits = credential.model_rate_limits
+        }
+        await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+        // 更新 account entry 的过期时间与 refreshable
+        const expiresAt = refreshed.expires_at ? Date.parse(refreshed.expires_at) : undefined
+        await pool.updateAccount(entry.id, {
+          expiresAt: expiresAt !== undefined && !Number.isNaN(expiresAt) ? expiresAt : undefined,
+          refreshable: Boolean(refreshed.refresh_token),
+        })
+      } catch (error) {
+        if (error instanceof RefreshTokenExpiredError) {
+          try {
+            await pool.updateAccount(entry.id, { refreshable: false })
+          } catch {
+            // 忽略 updateAccount 本身的错误
+          }
+        }
+        // 单账号失败不中断循环
+      }
     }
   }
 

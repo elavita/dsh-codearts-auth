@@ -15,6 +15,13 @@ import {
 const futureMs = Date.now() + 7_200_000
 const pastMs = Date.now() - 60_000
 
+/** 构造一个仅用于解析测试的未签名 JWT（payload 可自定义）。 */
+function makeJwt(payload: Record<string, unknown>): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url')
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  return `${header}.${body}.signature`
+}
+
 describe('buddy credential parsing', () => {
   it('parseTokenData accepts string fields and defaults tokenType to Bearer', () => {
     const token = parseTokenData({
@@ -25,15 +32,66 @@ describe('buddy credential parsing', () => {
       scope: '',
       domain: 'copilot.tencent.com',
     })
+    // ISO 绝对时间被归一化为毫秒时间戳字符串（credentialExpiresAtMs 统一解析）。
     expect(token).toEqual({
       accessToken: 'AT',
       refreshToken: 'RT',
-      expiresAt: '2026-08-30T00:00:00Z',
-      refreshExpiresAt: '2026-09-29T00:00:00Z',
+      expiresAt: String(Date.parse('2026-08-30T00:00:00Z')),
+      refreshExpiresAt: String(Date.parse('2026-09-29T00:00:00Z')),
       tokenType: 'Bearer',
       scope: '',
       domain: 'copilot.tencent.com',
     })
+  })
+
+  it('parseTokenData 用 expiresIn 相对秒数换算绝对过期时间（e2e 实证格式）', () => {
+    // 真实响应不含 expiresAt/refreshExpiresAt，只有 expiresIn/refreshExpiresIn。
+    // JWT 的 iat=1789132433 / exp=1794316433 作为换算基准。
+    const accessToken = makeJwt({ iat: 1789132433, exp: 1794316433, nickname: 'Jet' })
+    const token = parseTokenData({
+      accessToken,
+      refreshToken: 'RT',
+      expiresIn: 5184000,
+      refreshExpiresIn: 7776000,
+      tokenType: 'Bearer',
+      scope: 'profile offline_access email',
+      domain: 'copilot.tencent.com',
+    })
+    // 基准用 iat：1789132433000 + 5184000 * 1000
+    expect(token.expiresAt).toBe(String(1789132433000 + 5184000 * 1000))
+    expect(token.refreshExpiresAt).toBe(String(1789132433000 + 7776000 * 1000))
+    // 与 JWT exp 一致（5184000s = 60 天）
+    expect(Number(token.expiresAt)).toBe(1794316433 * 1000)
+  })
+
+  it('parseTokenData 在无 expiresIn 时保持空串，由 credentialExpiresAtMs 从 JWT exp 兜底', () => {
+    const accessToken = makeJwt({ exp: 1794316433 })
+    const token = parseTokenData({ accessToken, refreshToken: 'RT' })
+    expect(token.expiresAt).toBe('')
+    const ms = credentialExpiresAtMs({
+      access_token: accessToken, refresh_token: 'RT', expires_at: token.expiresAt,
+    })
+    expect(ms).toBe(1794316433 * 1000)
+  })
+
+  it('buildCredential 从 JWT 回填 nickname 与 user_id（login/account 常为空）', () => {
+    const accessToken = makeJwt({ sub: 'uid-from-jwt', nickname: 'Jet', preferred_username: '186' })
+    const credential = buildCredential(
+      parseTokenData({ accessToken, refreshToken: 'RT', expiresIn: 3600 }),
+      parseAccountData({ uid: '', nickname: '', type: 'personal' }),
+    )
+    expect(credential.nickname).toBe('Jet')
+    expect(credential.user_id).toBe('uid-from-jwt')
+    // 落盘安全性：JSON 必须是单行（多行会被 YAML 当块标量破坏结构）
+    expect(/[\r\n]/.test(JSON.stringify(credential))).toBe(false)
+  })
+
+  it('parseTokenData 清洗 scope 中的换行（否则破坏 YAML 中的凭据 JSON）', () => {
+    const token = parseTokenData({
+      accessToken: 'AT', refreshToken: 'RT', scope: 'profile\n    offline_access\n    email',
+    })
+    expect(token.scope).toBe('profile offline_access email')
+    expect(/[\r\n]/.test(JSON.stringify(token))).toBe(false)
   })
 
   it('parseTokenData stringifies numeric timestamps', () => {

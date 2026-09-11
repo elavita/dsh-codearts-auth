@@ -24,6 +24,98 @@ export interface CodeArtsCredentialResponse {
   error_msg?: string
 }
 
+/**
+ * ========================================
+ * ProviderAccountEntry 与多账号相关类型
+ * ========================================
+ */
+
+/** 每个模型的重置时间信息 */
+export interface RateLimitInfo {
+  /** 模型 ID（如 'deepseek-v4-flash'） */
+  modelId: string
+  /** 重置时间戳（毫秒）；0 或缺失 = 不在重置期 */
+  resetAtMs: number
+}
+
+/** 账号索引条目（存于 ctx.settings，非 credentials） */
+export interface ProviderAccountEntry {
+  /** 账号唯一标识：{provider}-{shortid}（如 'codearts-a1b2c3d4'） */
+  id: string
+  /** provider 名称：'codearts' | 'buddy' */
+  provider: string
+  /** 用户可读昵称 */
+  nickname: string
+  /** 是否启用（停用不参与自动切换） */
+  enabled: boolean
+  /** 对应的 credential ref 名称：{PROVIDER}_ACCOUNT_{UUID_SHORT}（如 'CODEARTS_ACCOUNT_A1B2C3D4'） */
+  credentialRef: string
+  /** 创建时间（毫秒时间戳） */
+  createdAt: number
+  /** 凭据过期时间（毫秒时间戳），用于展示 */
+  expiresAt?: number
+  /** 是否可静默续期 */
+  refreshable: boolean
+  /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
+  modelRateLimits?: Record<string, number>
+}
+
+/** 账号详细状态（返回给 Client 展示） */
+export interface ProviderAccountStatus extends ProviderAccountEntry {
+  /** 最近刷新错误 */
+  refreshError?: string
+  /** 来源（env/file 等） */
+  source?: string
+}
+
+/** Jet Hub 在 ctx.settings 中的 schema */
+export interface JetHubConfig {
+  accounts: ProviderAccountEntry[]
+}
+
+/** RPC 端点请求/响应类型 */
+export interface RpcListAccountsRequest {
+  provider: string
+}
+export interface RpcListAccountsResponse {
+  accounts: ProviderAccountStatus[]
+}
+
+export interface RpcCreateAccountRequest {
+  provider: string
+}
+export interface RpcCreateAccountResponse {
+  accountId: string
+  loginUrl: string
+}
+
+export interface RpcPollLoginRequest {
+  accountId: string
+  provider: string
+}
+export interface RpcPollLoginResponse {
+  done: boolean
+  success?: boolean
+  error?: string
+}
+
+export interface RpcUpdateAccountRequest {
+  accountId: string
+  patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled'>>
+}
+
+export interface RpcDeleteAccountRequest {
+  accountId: string
+}
+
+export interface RpcRefreshAccountRequest {
+  accountId: string
+}
+export interface RpcRefreshAccountResponse {
+  success: boolean
+  error?: string
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string
@@ -39,6 +131,8 @@ export interface CodeArtsCredential {
   code_verifier?: string
   /** DPoP ES256 私钥 JWK（随凭据持久化，刷新换取时签发 DPoP JWS）。 */
   dpop_private_key_jwk?: DpopPrivateJwk
+  /** 模型速率限制/重置时间（框架层附加的运行时元数据，刷新凭据时需保留）。 */
+  model_rate_limits?: Record<string, unknown>
 }
 
 /** 一次登录流程的结果：已存储的凭据值及其过期时间。 */

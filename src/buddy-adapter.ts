@@ -14,6 +14,8 @@ import {
   attributionHeaders,
   LlmAdapter, LlmError,
 } from '@deepseek-ai/dsh-llm'
+import { AccountPool } from './account-pool.js'
+import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
@@ -88,6 +90,8 @@ export interface BuddyAdapterOptions {
   /** 动态拉取远端模型列表（含上下文窗口，若远端下发）；失败时调用方回退到静态列表。 */
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
   fetchImpl?: typeof fetch
+  /** 多账号池（用于限流时切换账号） */
+  accountPool?: AccountPool
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -273,8 +277,19 @@ export class BuddyAdapter extends LlmAdapter {
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
   }
 
+  /**
+   * 描述本适配器拥有的 provider 路由。
+   *
+   * DSH 会强制校验 `info.id === provider` 且 `info.name` 为非空字符串；
+   * 模型设置页还会用该 id 计算 `deriveKeyRef(provider)`（内部调用
+   * `provider.toUpperCase()`）。因此这里对入参做防御性归一化：
+   * 一旦 `provider` 不是字符串（例如上游传入了 undefined），
+   * 直接回退到本适配器声明时的 PROVIDER 常量，避免
+   * `undefined.toUpperCase is not a function` 在客户端炸开。
+   */
   providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'CodeBuddy (Tencent)' }
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : PROVIDER
+    return { id, name: 'CodeBuddy (Tencent)' }
   }
 
   /**
@@ -351,6 +366,19 @@ export class BuddyAdapter extends LlmAdapter {
       throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
     }
 
+    // Track current account for rate limit switching
+    let currentAccountId = ''
+    if (this.options.accountPool && credential) {
+      try {
+        currentAccountId = await this.options.accountPool.findAccountIdByCredential(
+          'buddy',
+          credential.access_token,
+        )
+      } catch (error) {
+        console.warn('[buddy] 账号匹配失败（不影响本次请求）:', error)
+      }
+    }
+
     // 2. 序列化消息
     const messages = serializeMessages(options.messages)
     if (options.system !== undefined && options.system.length > 0) {
@@ -395,6 +423,25 @@ export class BuddyAdapter extends LlmAdapter {
     }
     if (!response.ok) {
       const errorText = await response.text().catch(() => '')
+      // Rate limit detection and account switching
+      if (this.options.accountPool && isRateLimited(errorText)) {
+        const parsed = parseRateLimitError(errorText, options.model)
+        if (parsed && currentAccountId) {
+          await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs)
+          const next = await this.options.accountPool.getAvailableAccount('buddy', options.model)
+          if (next) {
+            credential = next.credential as BuddyCredential
+            currentAccountId = next.entry.id
+            response = await this.send(credential, body, options)
+            if (response.ok) {
+              yield* this.consumeSse(response, options)
+              return
+            }
+            // New response also failed — fall through to throw below
+          }
+          throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
+        }
+      }
       throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
     }
 

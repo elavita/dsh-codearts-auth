@@ -37,14 +37,21 @@ function withinTrial(now: Date = new Date()): boolean {
   return now >= TRIAL_START && now < TRIAL_END_EXCLUSIVE
 }
 
-const TRIAL_ACTIVE = withinTrial()
 const E2E = process.env.DSH_BUDDY_E2E === '1'
+
+/**
+ * 试用期结束后，本用例会消耗**付费额度**。因此除 DSH_BUDDY_E2E=1 外，
+ * 还要求显式确认（DSH_BUDDY_E2E_CONFIRM=yes）才会真正执行。
+ * 这防止 `DSH_BUDDY_E2E=1` 被顺手导出后误跑，产生真实费用。
+ */
+const CONFIRMED = process.env.DSH_BUDDY_E2E_CONFIRM === 'yes'
 
 /** 试用期已过的说明文案，供 skip 原因复用。 */
 const TRIAL_EXPIRED_REASON = 'CodeBuddy 14 天免费试用期已过（2026-08-28 ~ 2026-09-10，含首日），跳过真实后端调用以免产生付费额度消耗'
 
-// 收集期跳过：未显式开启 e2e 或免费试用期已过，整个 describe 都不执行。
-const suite = E2E && TRIAL_ACTIVE ? describe : describe.skip
+// 收集期跳过：未显式开启 e2e、未确认消耗额度、或仍在免费试用期外且未确认时，
+// 整个 describe 都不执行（报告显示 skipped，不产生任何网络调用）。
+const suite = E2E && CONFIRMED ? describe : describe.skip
 
 // 本轮验证的模型。hy4-preview 是默认模型且是本次排查的目标模型，
 // 另外带上 deepseek-v4-flash（适配器 DEFAULT_MODEL）与各家代表模型。

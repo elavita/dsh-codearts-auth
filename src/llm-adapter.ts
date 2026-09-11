@@ -6,6 +6,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { AccountPool } from './account-pool.js'
 import { signRequestHuawei } from './sign.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -59,6 +60,8 @@ export interface CodeArtsAdapterOptions {
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
+  /** 多账号池（用于限流时切换账号） */
+  accountPool?: AccountPool
 }
 
 /**
@@ -732,8 +735,17 @@ export class CodeArtsAdapter extends LlmAdapter {
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
   }
 
+  /**
+   * 描述本适配器拥有的 provider 路由。
+   *
+   * 与 BuddyAdapter 同款防御：DSH 校验 `info.id === provider`，且模型设置页
+   * 会用该 id 计算 `deriveKeyRef(provider)`（内部 `provider.toUpperCase()`）。
+   * 入参异常时回退到 PROVIDER 常量，避免客户端抛
+   * `undefined.toUpperCase is not a function`。
+   */
   providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'CodeArts Agent' }
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : PROVIDER
+    return { id, name: 'CodeArts Agent' }
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
@@ -792,6 +804,19 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
     if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
       throw new LlmError('codearts: no usable credential; log in first', 'MISSING_CREDENTIAL')
+    }
+
+    // Track current account id for rate limit tracking
+    let currentAccountId = ''
+    if (this.options.accountPool && credential?.access_key_id) {
+      try {
+        currentAccountId = await this.options.accountPool.findAccountIdByCredential(
+          'codearts',
+          credential.access_key_id,
+        )
+      } catch (error) {
+        console.warn('[codearts] 账号匹配失败（不影响本次请求）:', error)
+      }
     }
 
     const messages = serializeMessages(options.messages)
@@ -923,6 +948,28 @@ export class CodeArtsAdapter extends LlmAdapter {
             throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL')
           }
           continue
+        }
+        // Rate limit detection and account switching
+        if (this.options.accountPool && isRateLimited(errorText)) {
+          const parsed = parseRateLimitError(errorText, options.model)
+          if (parsed) {
+            // Update current account's rate limit
+            if (currentAccountId) {
+              await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs)
+            }
+            // Try to get next available account
+            const next = await this.options.accountPool.getAvailableAccount('codearts', options.model)
+            if (next) {
+              credential = next.credential as CodeArtsCredential
+              currentAccountId = next.entry.id
+              authRefreshed = false // Reset auth refresh flag for new credential
+              continue // Retry request with new credential
+            }
+            throw new LlmError(
+              `codearts: 模型 ${options.model} 所有账号均受限，请稍后再试`,
+              'RATE_LIMIT',
+            )
+          }
         }
         if (!isQueueError(response.status, errorText)) {
           // 非 TM.00001041 错误也未必没排队：openpangu 等模型的并发限流
@@ -1365,4 +1412,37 @@ export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOption
     { provider: PROVIDER, displayName: 'CodeArts Agent', settingsNs: 'llm-codearts', settingsPath: [] },
   ])
   ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
+}
+
+/** 判断错误文本是否为频率限制错误 */
+export function isRateLimited(body: string): boolean {
+  return /频率限制|rate.?limit|使用量已超出|频率超出|重置/i.test(body)
+}
+
+/** 从限流错误中提取重置时间 */
+export function parseRateLimitError(
+  body: string,
+  currentModel: string,
+): { modelId: string; resetTimeMs: number } | null {
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const msg = typeof data.msg === 'string' ? data.msg : ''
+    // buddy格式: "您的使用量已超出频率限制，将在 2026-09-11 18:08:17 UTC+8 重置"
+    const resetMatch = /将在\s+([\d-]+\s+[\d:]+)\s+UTC[+-]\d+/.exec(msg)
+    if (resetMatch) {
+      const resetTimeStr = resetMatch[1] + ' UTC+8'
+      const resetMs = Date.parse(resetTimeStr)
+      if (!Number.isNaN(resetMs)) {
+        return { modelId: currentModel, resetTimeMs: resetMs }
+      }
+    }
+    // 标准 OpenAI 429 格式
+    if (isRateLimited(body)) {
+      // fallback: 1小时后重试
+      return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
+    }
+    return null
+  } catch {
+    return null
+  }
 }

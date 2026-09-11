@@ -21,6 +21,7 @@ import {
 } from './buddy-oauth.js'
 import { RefreshScheduler } from './refresh.js'
 import type { BuddyCredential } from './buddy.js'
+import { AccountPool } from './account-pool.js'
 
 /** Buddy 登录结果存储所用的凭据引用。 */
 export const BUDDY_CREDENTIAL_REF = 'BUDDY_ACCESS_TOKEN'
@@ -98,9 +99,9 @@ export class BuddyAuth extends Service {
   }
 
   /** 运行登录流程并持久化凭据。 */
-  async login(flowOptions: BuddyLoginFlowOptions = {}): Promise<BuddyLoginResult> {
+  async login(flowOptions: { refName?: string; accountId?: string; pool?: AccountPool } & BuddyLoginFlowOptions = {}): Promise<BuddyLoginResult> {
     this.active = true
-    const ref = credentialRef(BUDDY_CREDENTIAL_REF)
+    const ref = flowOptions.refName ? credentialRef(flowOptions.refName) : credentialRef(BUDDY_CREDENTIAL_REF)
     const flow = await runBuddyLoginFlow({
       ...this.options.fetcher !== undefined ? { fetcher: this.options.fetcher } : {},
       ...flowOptions,
@@ -110,12 +111,46 @@ export class BuddyAuth extends Service {
     this.lastRefreshError = undefined
     this.scheduleRefresh()
     const credential = parseCredential(flow.access)
+    // 多账号：accountId 提供时自动注册到 pool
+    if (flowOptions.accountId && flowOptions.pool) {
+      await flowOptions.pool.addAccount({
+        id: flowOptions.accountId,
+        provider: 'buddy',
+        nickname: flowOptions.accountId,
+        enabled: true,
+        credentialRef: flowOptions.refName ?? BUDDY_CREDENTIAL_REF,
+        createdAt: Date.now(),
+        expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
+        refreshable: Boolean(credential) && isRefreshable(credential!),
+      })
+    }
     return {
       access: flow.access,
       expires: flow.expires,
       ref,
       loginUrl: flow.loginUrl,
       refreshable: Boolean(credential) && isRefreshable(credential!),
+    }
+  }
+
+  /**
+   * 保存凭据并注册到账号池（供后台登录流程使用）。
+   * 账号池已预先创建占位条目时，只做凭据写入和更新。
+   */
+  async saveCredential(credentialJson: string, refName: string, accountId: string, pool: AccountPool): Promise<void> {
+    this.active = true
+    const ref = credentialRef(refName)
+    await this.ctx.credentials.set(ref, credentialJson)
+    this.refreshTokenInvalid = false
+    this.lastRefreshError = undefined
+    this.scheduleRefresh()
+    const credential = parseCredential(credentialJson)
+    if (accountId && pool) {
+      await pool.updateAccount(accountId, {
+        nickname: credential?.nickname ?? accountId,
+        expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
+        refreshable: Boolean(credential) && isRefreshable(credential!),
+      })
     }
   }
 
@@ -181,6 +216,57 @@ export class BuddyAuth extends Service {
     }
   }
 
+  /**
+   * 批量续期所有 buddy 账号。
+   * 遍历 pool 中 enabled + refreshable 的 buddy 账号，逐一续期。
+   * 单账号失败不影响其他账号。
+   */
+  async refreshAll(pool: AccountPool): Promise<void> {
+    const accounts = await pool.listAccounts('buddy')
+    for (const entry of accounts) {
+      if (!entry.enabled || !entry.refreshable) continue
+      try {
+        const ref = credentialRef(entry.credentialRef)
+        const resolved = await this.ctx.credentials.resolve(ref)
+        if (!resolved) {
+          await pool.updateAccount(entry.id, { refreshable: false })
+          continue
+        }
+        const credential = parseCredential(resolved.value)
+        if (!credential || !isRefreshable(credential)) {
+          await pool.updateAccount(entry.id, { refreshable: false })
+          continue
+        }
+        const token = await refreshToken(credential, this.fetchImpl)
+        const refreshed: BuddyCredential = {
+          ...credential,
+          access_token: token.accessToken,
+          refresh_token: token.refreshToken,
+          expires_at: token.expiresAt,
+          refresh_expires_at: token.refreshExpiresAt,
+          token_type: token.tokenType,
+          scope: token.scope,
+          ...token.domain.length > 0 ? { domain: token.domain } : {},
+        }
+        await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+        const expiresAt = credentialExpiresAtMs(refreshed)
+        await pool.updateAccount(entry.id, {
+          expiresAt: expiresAt ?? undefined,
+          refreshable: isRefreshable(refreshed),
+        })
+      } catch (error) {
+        if (error instanceof RefreshTokenExpiredError) {
+          try {
+            await pool.updateAccount(entry.id, { refreshable: false })
+          } catch {
+            // 忽略 updateAccount 本身的错误
+          }
+        }
+        // 单账号失败不中断循环
+      }
+    }
+  }
+
   /** 移除已存储的凭据并停止任何待处理的刷新。 */
   async logout(): Promise<void> {
     // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
@@ -217,8 +303,15 @@ export class BuddyAuth extends Service {
   /**
    * GET /v3/config → 获取远端模型列表（craft agent 的 models）。
    * 失败或未登录时返回空数组（调用方回退到内置列表）。
+   *
+   * 优先使用账号池中的可用账号；无账号池或池为空时回退到固定凭据 ref。
    */
-  async fetchModels(): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
+  async fetchModels(pool?: AccountPool): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
+    // 优先账号池
+    if (pool) {
+      const available = await pool.getAvailableAccount('buddy', '')
+      if (available) return fetchModels(available.credential as BuddyCredential, this.fetchImpl)
+    }
     const resolved = await this.ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
     if (!resolved) return []
     const credential = parseCredential(resolved.value)

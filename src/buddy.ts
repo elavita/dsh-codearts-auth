@@ -141,17 +141,57 @@ export interface BuddyAccount {
 /**
  * 从凭据 expires_at 解析毫秒时间戳（兼容毫秒时间戳 / 秒级时间戳 / ISO 8601）。
  * 无法解析或缺失时返回 undefined。
+ *
+ * 后备来源（e2e 实证 2026-09-11）：CodeBuddy 的 `/v2/plugin/auth/token`
+ * **不返回绝对的 `expiresAt`**，只返回相对的 `expiresIn`。若凭据里的
+ * `expires_at` 为空（历史写入或后端变更），回退到解析 access_token 这个
+ * JWT 的 `exp` 声明——它同样是权威的过期时刻。
  */
 export function credentialExpiresAtMs(credential: BuddyCredential): number | undefined {
   const raw = credential.expires_at
-  if (typeof raw !== 'string' || raw.length === 0) return undefined
-  // 纯数字：视为时间戳。> 1e12 为毫秒，否则为秒。
-  if (/^\d+$/.test(raw)) {
-    const value = Number(raw)
-    return value > 1_000_000_000_000 ? value : value * 1000
+  if (typeof raw === 'string' && raw.length > 0) {
+    // 纯数字：视为时间戳。> 1e12 为毫秒，否则为秒。
+    if (/^\d+$/.test(raw)) {
+      const value = Number(raw)
+      return value > 1_000_000_000_000 ? value : value * 1000
+    }
+    const parsed = Date.parse(raw)
+    if (!Number.isNaN(parsed)) return parsed
   }
-  const parsed = Date.parse(raw)
-  return Number.isNaN(parsed) ? undefined : parsed
+  return jwtExpiresAtMs(credential.access_token)
+}
+
+/**
+ * 从 JWT 的 payload 读取 `exp`（秒）并换算为毫秒；非 JWT 或解析失败返回 undefined。
+ * 仅做 base64url 解码，不验签——该值只用于展示与续期调度。
+ */
+export function jwtExpiresAtMs(token: string): number | undefined {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  const parts = token.split('.')
+  if (parts.length < 2) return undefined
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { exp?: unknown }
+    return typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp * 1000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 从 JWT payload 读取 `nickname`（CodeBuddy 的 login/account 响应不含昵称，
+ * 昵称只在 access_token 的声明里）。解析失败返回空串。
+ */
+export function jwtNickname(token: string): string {
+  if (typeof token !== 'string' || token.length === 0) return ''
+  const parts = token.split('.')
+  if (parts.length < 2) return ''
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>
+    const nickname = payload.nickname ?? payload.preferred_username ?? payload.name
+    return typeof nickname === 'string' ? stripControlChars(nickname) : ''
+  } catch {
+    return ''
+  }
 }
 
 /** 凭据是否已过期；无法解析过期时间时不判定过期（对齐 Rust is_expired）。 */
@@ -186,30 +226,109 @@ export function credentialAuthHeaders(credential: BuddyCredential): Record<strin
   }
 }
 
-/** 从 JSON 安全读取字符串字段（兼容后端把时间戳返回为数字）。 */
+/**
+ * 从 JSON 安全读取字符串字段（兼容后端把时间戳返回为数字）。
+ *
+ * 会剔除 CR/LF 等控制字符：CodeBuddy 的 `scope` 字段有时返回多行文本
+ * （如 "profile\n    offline_access\n    email"）。这些换行会被凭据的
+ * JSON 字符串原样携带，并在落盘到 YAML（`.credentials.yaml`）时被当作
+ * 多行标量，破坏 JSON 结构 —— 重新读取时 `JSON.parse` 失败，表现为
+ * 有效期/昵称等字段"丢失"（实际是整个凭据无法解析）。
+ */
 function readStringField(data: Record<string, unknown>, key: string): string {
   const value = data[key]
-  if (typeof value === 'string') return value
+  if (typeof value === 'string') return stripControlChars(value)
   if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   return ''
 }
 
-/** 从 JSON 解析令牌数据（兼容 camelCase 字段名与数字型时间戳）。 */
+/** 去掉字符串中的控制字符（含 CR/LF/Tab），并把连续空白折叠为单个空格。 */
+function stripControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\u0000-\u001F\u007F]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+}
+
+/** 从 JSON 读取数值字段（兼容后端返回数字型字符串）。 */
+function readNumberField(data: Record<string, unknown>, key: string): number | undefined {
+  const value = data[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) return Number(value)
+  return undefined
+}
+
+/**
+ * 若令牌本身未携带绝对 `expiresAt`，则用相对秒数（`expiresIn`）换算为绝对毫秒时间戳。
+ * 换算基准取 access_token 的 JWT `exp`（优先，权威）或当前时刻。
+ */
+function absoluteExpiryMs(
+  record: Record<string, unknown>,
+  absoluteKey: string,
+  relativeKey: string,
+  accessToken: string,
+): string {
+  const absolute = readStringField(record, absoluteKey)
+  if (absolute.length > 0) {
+    // 归一化为毫秒时间戳字符串，交由 credentialExpiresAtMs 统一解析。
+    const asNumber = /^\d+$/.test(absolute) ? Number(absolute) : Date.parse(absolute)
+    if (Number.isFinite(asNumber)) {
+      const ms = asNumber > 1_000_000_000_000 ? asNumber : asNumber * 1000
+      return String(ms)
+    }
+    return absolute
+  }
+  const relativeSeconds = readNumberField(record, relativeKey)
+  if (relativeSeconds === undefined) {
+    // 无相对值：交给 JWT exp 兜底（access_token 的 exp 即权威过期时刻）。
+    return absoluteKey === 'expiresAt' ? '' : ''
+  }
+  // 基准：access_token 的签发时刻（iat）优先，缺失时用当前时刻。
+  const baseMs = jwtIssuedAtMs(accessToken) ?? Date.now()
+  return String(baseMs + relativeSeconds * 1000)
+}
+
+/** 从 JWT payload 读取 `iat`（秒）并换算为毫秒。 */
+function jwtIssuedAtMs(token: string): number | undefined {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  const parts = token.split('.')
+  if (parts.length < 2) return undefined
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { iat?: unknown }
+    return typeof payload.iat === 'number' && Number.isFinite(payload.iat) ? payload.iat * 1000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 从 JSON 解析令牌数据（兼容 camelCase 字段名与数字型时间戳）。
+ *
+ * e2e 实证（2026-09-11）：`/v2/plugin/auth/token` 实际只返回
+ * `expiresIn` / `refreshExpiresIn`（相对秒数），**没有** `expiresAt` /
+ * `refreshExpiresAt`。因此这里在绝对字段缺失时用相对秒数换算，
+ * 否则凭据的 `expires_at` 会一直是空串（UI 显示"有效期未知"）。
+ */
 export function parseTokenData(data: unknown): BuddyToken {
   const record = (typeof data === 'object' && data !== null ? data : {}) as Record<string, unknown>
   const tokenType = readStringField(record, 'tokenType')
+  const accessToken = readStringField(record, 'accessToken')
   return {
-    accessToken: readStringField(record, 'accessToken'),
+    accessToken,
     refreshToken: readStringField(record, 'refreshToken'),
-    expiresAt: readStringField(record, 'expiresAt'),
-    refreshExpiresAt: readStringField(record, 'refreshExpiresAt'),
+    expiresAt: absoluteExpiryMs(record, 'expiresAt', 'expiresIn', accessToken),
+    refreshExpiresAt: absoluteExpiryMs(record, 'refreshExpiresAt', 'refreshExpiresIn', accessToken),
     tokenType: tokenType.length > 0 ? tokenType : 'Bearer',
     scope: readStringField(record, 'scope'),
     domain: readStringField(record, 'domain'),
   }
 }
 
-/** 从 JSON 解析账户数据。 */
+/**
+ * 从 JSON 解析账户数据。
+ *
+ * `login/account` 响应不含 `nickname`（e2e 实证：只有 uid/nickname 之外的
+ * 字段都为空），昵称实际在 access_token 的 JWT 声明里；调用方通过
+ * `buildCredential` 时传入 token 以便回填。
+ */
 export function parseAccountData(data: unknown): BuddyAccount {
   const record = (typeof data === 'object' && data !== null ? data : {}) as Record<string, unknown>
   const accountType = readStringField(record, 'type')
@@ -221,8 +340,16 @@ export function parseAccountData(data: unknown): BuddyAccount {
   }
 }
 
-/** 组合令牌与账户数据为可持久化的凭据。 */
+/**
+ * 组合令牌与账户数据为可持久化的凭据。
+ *
+ * 昵称回填顺序（e2e 实证 2026-09-11：`login/account` 的 `nickname` 常为空，
+ * 真正的昵称只在 access_token 的 JWT 声明里）：
+ * account.nickname → JWT.nickname → JWT.preferred_username。
+ * 过期时间同理：token.expiresAt 为空时由 credentialExpiresAtMs 从 JWT exp 兜底。
+ */
 export function buildCredential(token: BuddyToken, account: BuddyAccount): BuddyCredential {
+  const nickname = account.nickname.length > 0 ? account.nickname : jwtNickname(token.accessToken)
   return {
     access_token: token.accessToken,
     refresh_token: token.refreshToken,
@@ -231,10 +358,23 @@ export function buildCredential(token: BuddyToken, account: BuddyAccount): Buddy
     token_type: token.tokenType,
     scope: token.scope,
     domain: token.domain,
-    user_id: account.uid,
-    nickname: account.nickname,
+    user_id: account.uid.length > 0 ? account.uid : jwtSubject(token.accessToken),
+    nickname,
     enterprise_id: account.enterpriseId,
     account_type: account.accountType,
+  }
+}
+
+/** 从 JWT payload 读取 `sub`（用户 id）；解析失败返回空串。 */
+function jwtSubject(token: string): string {
+  if (typeof token !== 'string' || token.length === 0) return ''
+  const parts = token.split('.')
+  if (parts.length < 2) return ''
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>
+    return typeof payload.sub === 'string' ? payload.sub : ''
+  } catch {
+    return ''
   }
 }
 

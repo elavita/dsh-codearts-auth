@@ -10,6 +10,7 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./client": "./lib/client/jet-hub.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -18,15 +19,29 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:client": "node plugin-src/client/build.mjs",
+    "build:all": "pnpm build && pnpm build:client",
     "prepare": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:e2e": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts",
-    "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts"
+    "test:e2e:login": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/login.e2e.spec.ts",
+    "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts",
+    "test:e2e:buddy-cache": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-cache-probe.e2e.spec.ts",
+    "test:e2e:buddy-probe": "cross-env DSH_BUDDY_PROBE=1 vitest run --config vitest.e2e.config.ts tests/e2e/buddy-login-probe.e2e.spec.ts",
+    "test:e2e:buddy-pool": "cross-env DSH_BUDDY_POOL_E2E=1 DSH_BUDDY_POOL_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-pool-probe.e2e.spec.ts",
+    "test:e2e:codearts": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/v4-models.e2e.spec.ts tests/e2e/v4-large-write.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
     }
   },
   "peerDependencies": {
@@ -45,6 +60,7 @@
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
     "@types/node": "^22.0.0",
     "cross-env": "^7.0.3",
+    "esbuild": "^0.24.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
