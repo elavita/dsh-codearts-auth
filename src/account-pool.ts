@@ -1,5 +1,6 @@
 import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
 import type {
   CodeArtsCredential,
@@ -27,26 +28,30 @@ interface SettingsScopeLike {
   replace(section: object): Promise<void>
 }
 
-/** ctx.settings 服务的最小接口。schema 必须是可调用对象（DSH 以 `schema(value)` 解析）。 */
+/** ctx.settings 服务的最小接口。schema 必须是 schemastery schema。 */
 interface SettingsServiceLike {
-  register(ns: string, schema: (value: unknown) => unknown): SettingsScopeLike
+  register(ns: string, schema: unknown): SettingsScopeLike
   describe(options?: { redactSecrets?: boolean }): Array<{ ns: string; value: unknown }>
 }
 
 /**
  * Jet Hub 的 settings schema。
  *
- * DSH 的 SettingsProvider.resolve() 会把 schema 当作**函数**调用：
- *   `const value = schema(mergeLayers(base, section))`
- * 因此这里必须提供可调用的 schema（schemastery 对象即为此形态）。
- * 账号列表是动态结构，此处只做「取 accounts 数组」的宽松归一化，
+ * 必须是 **schemastery schema**，不能是裸函数。schemastery 对象既可调用
+ * （`schema(value)` 解析，满足 SettingsProvider.resolve 的用法），又有
+ * `toJSON()` 与 `redactSecrets()` 所需的结构；而裸函数只有前者 ——
+ * `settings.describe()` 会对每个注册项无条件调用 `schema.toJSON()`，
+ * 裸函数会让整条 describe() 抛
+ * `TypeError: registration.schema.toJSON is not a function`，
+ * 进而使模型设置页、主题设置，以及 sidebar 的
+ * `/sidebar/api/settings.get`、`/api/shell.get` 全部 500。
+ *
+ * 账号列表是动态结构，此处用 `Schema.array(Schema.any())` 承接，
  * 单项字段由 AccountPool 自身在读写时保证。
  */
-function jetHubSchema(value: unknown): JetHubSettingsValue {
-  if (typeof value !== 'object' || value === null) return { accounts: [] }
-  const accounts = (value as Record<string, unknown>).accounts
-  return { accounts: Array.isArray(accounts) ? accounts as ProviderAccountEntry[] : [] }
-}
+const jetHubSchema = Schema.object({
+  accounts: Schema.array(Schema.any()).default([]),
+})
 
 /**
  * AccountPool —— 多账号管理核心

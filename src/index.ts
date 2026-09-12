@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
@@ -20,18 +21,23 @@ export const inject = ['credentials', 'commands', 'llm', 'connection']
  * 在 `refFor → deriveKeyRef(provider)` 处会以
  * `provider.toUpperCase is not a function` 崩溃。
  * 两者都只需承接一个可选的 `providers` 映射，故共用同一宽松 schema。
+ *
+ * 注意：`settings.register()` 要求 schemastery schema —— `describe()` 会对每个
+ * 注册项无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`。
+ * 传入裸函数（`(value) => ...`）会让 `describe()` 抛
+ * `TypeError: registration.schema.toJSON is not a function`，进而使所有
+ * 依赖 settings 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）
+ * 全部失败。因此这里必须用 `Schema.object({...})` 构造。
  */
-function providerSettingsSchema(value: unknown): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null) return { providers: {} }
-  const providers = (value as Record<string, unknown>).providers
-  return { providers: typeof providers === 'object' && providers !== null ? providers : {} }
-}
+const providerSettingsSchema = Schema.object({
+  providers: Schema.dict(Schema.any()).default({}),
+})
 
 /** 注册 provider 配置 namespace（已存在时忽略重复注册错误）。 */
 function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
   const settings = ctx.get('settings') as
     | {
-      register: (ns: string, schema: (value: unknown) => unknown) => unknown
+      register: (ns: string, schema: unknown) => unknown
       describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
     }
     | undefined
@@ -47,14 +53,22 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
     }
   }
   // 回读确认：模型设置页要求 settingsNs 真实存在于 describe() 中。
+  // 注意：describe() 会遍历所有已注册 namespace 并调用各自 schema 的
+  // toJSON()/redactSecrets()，任一注册项的 schema 不合规都会让整条调用抛错。
+  // 因此这里必须把异常打出来，而不是静默吞掉。
   try {
-    const registered = settings.describe?.({ redactSecrets: true }).map(v => v.ns) ?? []
+    const descriptors = settings.describe?.({ redactSecrets: true }) ?? []
+    const registered = descriptors.map(v => v.ns)
     const missing = namespaces.filter(ns => !registered.includes(ns))
     if (missing.length > 0) {
       ctx.logger.warn(`[codearts-auth] provider namespace 未生效: ${missing.join(', ')}`)
     }
-  } catch {
-    // describe 不可用时忽略（仅诊断用途）
+    ctx.logger.info(`[codearts-auth] settings.describe ok, namespaces: ${registered.join(', ')}`)
+  } catch (error) {
+    ctx.logger.error(
+      `[codearts-auth] settings.describe 失败（将导致模型设置页/sidebar settings API 不可用）: `
+      + `${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+    )
   }
 }
 
