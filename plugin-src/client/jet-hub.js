@@ -204,6 +204,13 @@ function ProviderPanel({ provider, rpcCall }) {
 
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
+  // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
+  const [version, setVersion] = React.useState(0);
+
+  const selectProvider = (id) => {
+    setSelected(id);
+    setVersion(v => v + 1);
+  };
 
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     React.createElement('header', { className: 'dim-jh-header' },
@@ -222,7 +229,7 @@ export function JetHubPage({ close, rpcCall }) {
           role: 'tab',
           className: 'dim-jh-provider',
           'aria-selected': p.id === selected,
-          onClick: () => setSelected(p.id),
+          onClick: () => selectProvider(p.id),
         },
         React.createElement(ProviderLogo, { provider: p.id }),
         React.createElement('span', null,
@@ -233,7 +240,7 @@ export function JetHubPage({ close, rpcCall }) {
       },
       PROVIDERS.map(p => p.id === selected
         ? React.createElement(ProviderPanel, {
-            key: p.id,
+            key: p.id + '-' + version,
             provider: p.id,
             rpcCall,
           })

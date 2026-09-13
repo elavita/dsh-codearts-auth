@@ -3,22 +3,39 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
-/** 伪造的 MockContext */
-function createMockContext(initialAccounts: ProviderAccountEntry[] = []) {
+/**
+ * 伪造的 MockContext。
+ *
+ * `staleReads` 选项模拟 DSH settings 服务的真实行为：`scope.get()` 返回的是
+ * 服务内部的 resolved 快照，`replace()` 之后该快照未必立即更新。开启后
+ * get() 会返回上一次 replace() 之前的值——用于复现"连续记录限流互相覆盖"。
+ */
+function createMockContext(
+  initialAccounts: ProviderAccountEntry[] = [],
+  options: { staleReads?: boolean } = {},
+) {
   let stored: { accounts?: ProviderAccountEntry[] } = { accounts: initialAccounts }
+  // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
+  let visible: { accounts?: ProviderAccountEntry[] } = stored
+  const replaceCalls: Array<ProviderAccountEntry[]> = []
   const mockSettings = {
-    // AccountPool 构造时注册 namespace，拿到 owner scope
     register: (_ns: string, _schema: unknown) => ({
-      get: () => stored,
+      get: () => (options.staleReads ? visible : stored),
       replace: async (value: { accounts?: ProviderAccountEntry[] }) => {
+        if (options.staleReads) {
+          // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
+          visible = stored
+        }
         stored = value
+        replaceCalls.push(value.accounts ?? [])
       },
     }),
     describe: () => [{ ns: 'jet-hub', value: stored }],
   }
   const mockCredentials = new Map<string, string>()
   return {
-    logger: { warn: () => {} },
+    replaceCalls,
+    logger: { warn: () => {}, info: () => {} },
     get: (key: string) => key === 'settings' ? mockSettings : undefined,
     credentials: {
       describe: async (ref: ReturnType<typeof credentialRef>) => {
@@ -181,5 +198,34 @@ describe('AccountPool', () => {
   it('should handle updateModelRateLimit for non-existent account gracefully', async () => {
     await pool.updateModelRateLimit('nonexistent', 'deepseek-v4-flash', Date.now() + 3600000)
     // 不会抛出
+  })
+
+  /**
+   * 回归：settings scope 的 get() 滞后于 replace() 时，连续记录多个账号的
+   * 限流不能互相覆盖。
+   *
+   * 曾经的实现每次都以 scope.get() 为读源，若快照滞后，第二次写入会基于
+   * 不含第一次记录的旧快照整体 replace，把前一条限流抹掉——表现为
+   * "多个账号都触发过限流，settings.yaml 里却一条 modelRateLimits 都没有"。
+   */
+  it('keeps earlier rate limits when recording several accounts under a stale scope', async () => {
+    const staleCtx = createMockContext([], { staleReads: true })
+    const stalePool = new AccountPool(staleCtx as never)
+
+    await stalePool.addAccount(makeMockAccount({ id: 'acct-1', credentialRef: 'BUDDY_ACCOUNT_T1' }))
+    await stalePool.addAccount(makeMockAccount({ id: 'acct-2', credentialRef: 'BUDDY_ACCOUNT_T2' }))
+    await stalePool.addAccount(makeMockAccount({ id: 'acct-3', credentialRef: 'BUDDY_ACCOUNT_T3' }))
+
+    const t1 = Date.now() + 3_600_000
+    const t2 = Date.now() + 7_200_000
+    const t3 = Date.now() + 10_800_000
+    await stalePool.updateModelRateLimit('acct-1', 'deepseek-v4.1-flash', t1)
+    await stalePool.updateModelRateLimit('acct-2', 'deepseek-v4.1-flash', t2)
+    await stalePool.updateModelRateLimit('acct-3', 'deepseek-v4.1-flash', t3)
+
+    const list = await stalePool.listAllAccounts()
+    const limits = list.map(a => a.modelRateLimits?.['deepseek-v4.1-flash'])
+    // 三条记录都必须留存（fix 前这里会是 [undefined, undefined, t3] 或类似）
+    expect(limits).toEqual([t1, t2, t3])
   })
 })

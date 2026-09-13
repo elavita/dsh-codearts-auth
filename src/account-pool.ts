@@ -1,4 +1,4 @@
-import { Context } from '@deepseek-ai/cordis'
+﻿import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
@@ -70,12 +70,25 @@ const jetHubSchema = Schema.object({
 export class AccountPool {
   /** 已注册的 settings scope；未注册成功时为 undefined。 */
   private scope: SettingsScopeLike | undefined
-  /** scope 不可用时的内存兜底（进程内有效，不持久化）。 */
-  private fallback: ProviderAccountEntry[] = []
+  /**
+   * 账号列表的**权威进程内副本**。
+   *
+   * 不直接依赖 `scope.get()`：settings 服务的 resolved 快照在 replace() 后
+   * 未必立即更新，而本类的每次写入都是「读 → 改 → 整体 replace」。
+   * 若以滞后快照为读源，并发/连续的 updateModelRateLimit 会互相覆盖
+   * （典型表现：多个账号触发限流后，settings.yaml 里一条 modelRateLimits
+   * 都没有）。因此首次从 scope 载入后，这份副本即为唯一读源。
+   */
+  private cache: ProviderAccountEntry[] = []
+  /** 是否已从 settings scope 完成首次载入。 */
+  private loaded = false
 
   constructor(private readonly ctx: Context) {
     const settings = this.ctx.get('settings') as SettingsServiceLike | undefined
-    if (!settings || typeof settings.register !== 'function') return
+    if (!settings || typeof settings.register !== 'function') {
+      this.ctx.logger?.warn?.('[jet-hub] settings 服务不可用，账号列表仅存在于内存中')
+      return
+    }
     try {
       this.scope = settings.register(JET_HUB_NS, jetHubSchema)
     } catch (error) {
@@ -84,20 +97,36 @@ export class AccountPool {
     }
   }
 
-  /** 读取账号列表（scope 优先，其次内存兜底）。 */
-  private readAccounts(): ProviderAccountEntry[] {
-    if (this.scope) {
-      const value = this.scope.get() as JetHubSettingsValue | undefined
-      const accounts = value?.accounts
-      return Array.isArray(accounts) ? accounts : []
+  /** 首次访问时从 settings scope 载入账号列表。 */
+  private ensureLoaded(): void {
+    if (this.loaded) return
+    this.loaded = true
+    if (!this.scope) return
+    const value = this.scope.get() as JetHubSettingsValue | undefined
+    const accounts = value?.accounts
+    if (Array.isArray(accounts)) {
+      this.cache = accounts as ProviderAccountEntry[]
+    } else {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
+      )
     }
-    return this.fallback
   }
 
-  /** 持久化账号列表。 */
+  /** 读取账号列表（进程内权威副本）。 */
+  private readAccounts(): ProviderAccountEntry[] {
+    this.ensureLoaded()
+    return this.cache
+  }
+
+  /** 持久化账号列表（同时更新进程内权威副本）。 */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
-    this.fallback = accounts
-    if (!this.scope) return
+    this.cache = accounts
+    this.loaded = true
+    if (!this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，账号变更未持久化')
+      return
+    }
     await this.scope.replace({ accounts })
   }
 
@@ -240,16 +269,31 @@ export class AccountPool {
     return null
   }
 
-  /** 更新某账号某模型的重置时间 */
+  /**
+   * 更新某账号某模型的重置时间。
+   *
+   * 关键：基于**读取到的最新账号列表**做局部合并，再把整个列表写回。
+   * settings scope 的 get() 返回的是服务内部快照，可能滞后于磁盘；
+   * 但 replace() 是整体替换，因此这里每次都在最新快照上合并，
+   * 避免"写 A 的限流 → 读旧快照 → 写 B 的限流"把 A 的记录抹掉。
+   */
   async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void> {
     const accounts = this.readAccounts()
     const idx = accounts.findIndex(a => a.id === accountId)
-    if (idx === -1) return
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 不在账号列表中（已知: ${accounts.map(a => a.id).join(', ') || '空'}）`,
+      )
+      return
+    }
     const next = [...accounts]
     const entry = { ...next[idx] }
     entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
     next[idx] = entry
     await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,
+    )
   }
 
   /** 清理已过期的重置时间记录 */

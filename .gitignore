@@ -1,4 +1,4 @@
-docs/superpowers
+﻿docs/superpowers
 node_modules/
 lib/
 *.tsbuildinfo
@@ -12,3 +12,5 @@ lib/
 .deveco/
 -1
 stderr.log']
+commit-msg.tmp
+

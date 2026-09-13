@@ -893,6 +893,9 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
     // 同一次 stream() 调用最多 refresh 一次。
     let authRefreshed = false
+    // 因限流已尝试过的账号 id：保证每个账号只试一次，试完才判定"全部受限"。
+    const rateLimitTried = new Set<string>()
+    if (currentAccountId) rateLimitTried.add(currentAccountId)
     for (;;) {
       // glm-5.3-flash 是 benefit（免费额度）模型，后端要求 maas_type: benefit
       // 头参与 SDK-HMAC-SHA256 签名，否则返回 InferHub.002002009.404
@@ -949,17 +952,21 @@ export class CodeArtsAdapter extends LlmAdapter {
           }
           continue
         }
-        // Rate limit detection and account switching
+        // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
+        // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
+        // 保证每个账号只尝试一次，试完才判定"全部受限"——避免只试一个
+        // 就下结论，导致 UI 限流状态与实际判定不一致。
         if (this.options.accountPool && isRateLimited(errorText)) {
           const parsed = parseRateLimitError(errorText, options.model)
           if (parsed) {
-            // Update current account's rate limit
             if (currentAccountId) {
-              await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs)
+              await this.options.accountPool.updateModelRateLimit(
+                currentAccountId, parsed.modelId, parsed.resetTimeMs,
+              )
             }
-            // Try to get next available account
             const next = await this.options.accountPool.getAvailableAccount('codearts', options.model)
-            if (next) {
+            if (next && !rateLimitTried.has(next.entry.id)) {
+              rateLimitTried.add(next.entry.id)
               credential = next.credential as CodeArtsCredential
               currentAccountId = next.entry.id
               authRefreshed = false // Reset auth refresh flag for new credential
@@ -967,7 +974,7 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
             throw new LlmError(
               `codearts: 模型 ${options.model} 所有账号均受限，请稍后再试`,
-              'RATE_LIMIT',
+              'QUOTA_EXCEEDED',
             )
           }
         }

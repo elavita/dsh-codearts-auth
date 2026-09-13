@@ -374,6 +374,11 @@ export class BuddyAdapter extends LlmAdapter {
           'buddy',
           credential.access_token,
         )
+        if (currentAccountId === '') {
+          // 账号池里没有匹配该凭据的账号（例如用的是回退的单凭据），
+          // 此时限流无法归属到具体账号，也就无法在 UI 上显示标记。
+          console.warn('[buddy] 当前凭据未匹配到账号池条目，限流记录将被跳过')
+        }
       } catch (error) {
         console.warn('[buddy] 账号匹配失败（不影响本次请求）:', error)
       }
@@ -422,25 +427,42 @@ export class BuddyAdapter extends LlmAdapter {
       response = await this.send(credential, body, options)
     }
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      // Rate limit detection and account switching
+      let errorText = await response.text().catch(() => '')
+      // 限流处理：把当前账号在该模型上的重置时间记录下来，然后逐个尝试
+      // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
+      // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
+      // 状态与实际判定不一致）。
       if (this.options.accountPool && isRateLimited(errorText)) {
-        const parsed = parseRateLimitError(errorText, options.model)
-        if (parsed && currentAccountId) {
-          await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs)
-          const next = await this.options.accountPool.getAvailableAccount('buddy', options.model)
-          if (next) {
-            credential = next.credential as BuddyCredential
-            currentAccountId = next.entry.id
-            response = await this.send(credential, body, options)
-            if (response.ok) {
-              yield* this.consumeSse(response, options)
-              return
-            }
-            // New response also failed — fall through to throw below
+        const tried = new Set<string>()
+        if (currentAccountId) tried.add(currentAccountId)
+
+        for (;;) {
+          const parsed = parseRateLimitError(errorText, options.model)
+          if (!parsed) break
+          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
+          if (currentAccountId) {
+            await this.options.accountPool.updateModelRateLimit(
+              currentAccountId, parsed.modelId, parsed.resetTimeMs,
+            )
           }
-          throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
+          // 取下一个未尝试过的可用账号
+          const next = await this.options.accountPool.getAvailableAccount('buddy', options.model)
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          credential = next.credential as BuddyCredential
+          currentAccountId = next.entry.id
+          response = await this.send(credential, body, options)
+          if (response.ok) {
+            yield* this.consumeSse(response, options)
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          if (!isRateLimited(errorText)) {
+            // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
+            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+          }
         }
+        throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }
       throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
     }

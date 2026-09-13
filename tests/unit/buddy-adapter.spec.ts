@@ -1,4 +1,4 @@
-import { LlmError } from '@deepseek-ai/dsh-llm'
+﻿import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
 import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL } from '../../src/buddy-adapter.js'
@@ -664,6 +664,145 @@ async function collectChunks(adapter: BuddyAdapter, options: never): Promise<Arr
   }
   return chunks
 }
+
+/**
+ * 账号池限流切换。
+ *
+ * 覆盖的关键行为：一个账号触发用量限制后，应逐个尝试其余可用账号，
+ * **每个失败账号都要记录其限流重置时间**（UI 据此展示限流标记），
+ * 只有真正试完全部候选才报"所有账号均受限"。此前实现只试一个账号
+ * 就下结论，导致"UI 上还有未限流账号，对话却报全部受限"。
+ */
+describe('BuddyAdapter 账号池限流切换', () => {
+  /** 构造 6004 频率限制响应体。resetAt 用远未来时间，避免测试随时钟漂移。 */
+  function rateLimitBody(): string {
+    return JSON.stringify({
+      code: 6004,
+      msg: '您的使用量已超出频率限制，将在 2099-12-31 23:59:59 UTC+8 重置，您也可以切换其他模型继续使用。',
+    })
+  }
+
+  /**
+   * 记录 updateModelRateLimit / getAvailableAccount 调用的轻量 AccountPool 替身。
+   * @param current - 会话开始时就已启用的当前账号（token 与 resolveCredential 一致）
+   * @param candidates - 切换时按顺序返回的候选账号
+   */
+  function makePool(
+    current: { id: string; token: string },
+    candidates: Array<{ id: string; token: string }>,
+  ) {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const known = [current, ...candidates]
+    const queue = [...candidates]
+    return {
+      recorded,
+      /** 适配器用凭据内容反查账号 id。 */
+      async findAccountIdByCredential(_provider: string, identity: string) {
+        return known.find((a) => a.token === identity)?.id ?? ''
+      },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      async getAvailableAccount() {
+        const next = queue.shift()
+        if (next === undefined) return null
+        return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+      },
+    }
+  }
+
+  it('逐个尝试所有账号，每个失败账号都被记录限流', async () => {
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        // AT1 与 AT2 都限流，AT3 成功 —— 三个账号各试一次
+        if (token === 'AT3') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        return new Response(rateLimitBody(), { status: 400 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 三个账号都被尝试过，最终由 AT3 成功返回内容
+    expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 关键断言：失败的两个账号都被记录了限流时间（UI 才能显示标记）
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+    expect(pool.recorded.every((r) => r.modelId === DEFAULT_MODEL)).toBe(true)
+    expect(pool.recorded.every((r) => r.resetAtMs > Date.now())).toBe(true)
+  })
+
+  it('全部账号限流后才报错，且错误码为不可重试的 QUOTA_EXCEEDED', async () => {
+    const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async () => new Response(rateLimitBody(), { status: 400 }),
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('QUOTA_EXCEEDED')
+    // 两个账号都被记录了限流
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+  })
+
+  it('切换到的新账号以非限流错误失败时，抛出原始错误而非"全部受限"', async () => {
+    const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        if (token === 'AT2') {
+          return new Response(JSON.stringify({ error: { message: 'model not found' } }), { status: 404 })
+        }
+        return new Response(rateLimitBody(), { status: 400 })
+      },
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    // 不应被吞成 QUOTA_EXCEEDED —— 这是模型/请求错误，需要如实上报
+    expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
+    expect((error as LlmError).message).toContain('model not found')
+  })
+})
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */
 export { CHAT_API_BASE }
