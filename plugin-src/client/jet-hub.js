@@ -29,11 +29,39 @@ function formatTime(ts) {
   return d.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function AccountCard({ account, onToggle, onDelete }) {
+// 四个限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用同一份措辞。
+const RETEST_HELP = '对本账号每个「限额重置」标记的模型真实发送一条最小消息：'
+  + '正常返回则清除该标记，仍被限流则保留。会消耗少量模型额度。';
+const RETEST_ALL_HELP = '对本页全部账号（含已停用）执行「重测」：'
+  + '逐个模型真实发送一条最小消息，正常返回才清除标记。停用账号同样会发送。会消耗模型额度。';
+const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不发送任何请求。'
+  + '适用于你已确认额度恢复、只想清掉显示的情况。';
+const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
+
+/** 把一次重测/重置的响应汇总成一行可读文案。 */
+function summarizeProbe(kind, res) {
+  if (kind === 'reset' || kind === 'resetAll') {
+    const n = res?.clearedCount ?? 0;
+    return n > 0 ? `已清除 ${n} 条限流标记` : '没有可清除的限流标记';
+  }
+  const accounts = res?.accounts ?? [];
+  const cleared = res?.clearedCount ?? 0;
+  const still = accounts.reduce((sum, a) => sum + (a.stillLimited?.length ?? 0), 0);
+  const parts = [];
+  if (cleared > 0) parts.push(`已清除 ${cleared} 条`);
+  if (still > 0) parts.push(`${still} 条仍受限`);
+  if (parts.length === 0) parts.push('没有可重测的限流标记');
+  return parts.join('，');
+}
+
+function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
   const expired = typeof account.expiresAt === 'number' && account.expiresAt > 0 && account.expiresAt <= Date.now();
+  // 只要存在**任何**标记（即使已过期）就允许重测/重置——过期记录正是
+  // 用户最想清理的对象，而 UI 的 rateLimits 只显示未到期的。
+  const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
@@ -75,6 +103,18 @@ function AccountCard({ account, onToggle, onDelete }) {
     React.createElement('div', { className: 'dim-jh-accountActions' },
       React.createElement('button', {
         className: 'dim-jh-btn',
+        title: RETEST_HELP,
+        disabled: busy || !hasAnyLimit,
+        onClick: () => onRetest(account.id),
+      }, '重测'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        title: RESET_HELP,
+        disabled: busy || !hasAnyLimit,
+        onClick: () => onReset(account.id),
+      }, '重置'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
       React.createElement('button', {
@@ -89,6 +129,10 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
+  // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
+  const [probeBusy, setProbeBusy] = React.useState(null);
+  // 上一次重测/重置的结果文案（成功或失败）。
+  const [probeNotice, setProbeNotice] = React.useState(null);
   const mounted = React.useRef(true);
 
   const loadAccounts = React.useCallback(async () => {
@@ -173,16 +217,82 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 重测 / 重置的统一入口。
+   *
+   * kind 决定调用哪个 RPC：
+   * - 'retest'    account.retest    对单个账号发真实请求
+   * - 'retestAll' account.retestAll 对本页全部账号（含停用）发真实请求
+   * - 'reset'     account.reset     单账号直接清除标记
+   * - 'resetAll'  account.resetAll  本页全部账号（含停用）直接清除标记
+   *
+   * 重测会真实消耗模型额度，因此「重测所有」在执行前要求确认。
+   */
+  const runLimitAction = async (kind, accountId) => {
+    if (kind === 'retestAll' && !confirm('将对本页全部账号（含已停用）各发送一条真实消息来验证限流状态，会消耗模型额度。继续？')) {
+      return;
+    }
+    setProbeBusy(kind === 'retestAll' || kind === 'resetAll' ? 'all' : 'one');
+    setProbeNotice(null);
+    try {
+      let res;
+      if (kind === 'retest') res = await rpcCall('account.retest', { accountId });
+      else if (kind === 'retestAll') res = await rpcCall('account.retestAll', { provider });
+      else if (kind === 'reset') res = await rpcCall('account.reset', { accountId });
+      else res = await rpcCall('account.resetAll', { provider });
+
+      if (!mounted.current) return;
+      // 仍受限的模型要如实列出原因，否则用户只看到"没清除"会以为按钮失灵。
+      const details = (res?.accounts || [])
+        .flatMap(a => (a.stillLimited || []).map(m => `${a.nickname || a.accountId} · ${m.modelId}：${m.message || '仍受限'}`));
+      const summary = summarizeProbe(kind, res);
+      setProbeNotice({ tone: details.length > 0 ? 'warn' : 'ok', text: summary, details });
+      await loadAccounts();
+    } catch (caught) {
+      console.error('[jet-hub] limit action failed:', caught);
+      if (!mounted.current) return;
+      setProbeNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}`, details: [] });
+    } finally {
+      if (mounted.current) setProbeBusy(null);
+    }
+  };
+
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
     React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 } },
       React.createElement('h2', { style: { margin: 0, fontSize: 16, fontWeight: 600 } },
         `${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号管理`),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'data-kind': 'primary',
-        onClick: () => void createAccount(),
-        disabled: creating,
-      }, creating ? '正在登录…' : '+ 新建账号')),
+      React.createElement('div', { className: 'dim-jh-headerActions' },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: RETEST_ALL_HELP,
+          disabled: probeBusy !== null || accounts.length === 0,
+          onClick: () => void runLimitAction('retestAll'),
+        }, probeBusy === 'all' ? '重测中…' : '重测所有'),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: RESET_ALL_HELP,
+          disabled: probeBusy !== null || accounts.length === 0,
+          onClick: () => void runLimitAction('resetAll'),
+        }, '重置所有'),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          title: '通过浏览器登录一个新的账号并加入账号池。',
+          onClick: () => void createAccount(),
+          disabled: creating,
+        }, creating ? '正在登录…' : '+ 新建账号'))),
+    probeNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': probeNotice.tone,
+          role: 'status',
+        },
+        React.createElement('div', null, probeNotice.text),
+        probeNotice.details.length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              probeNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
+          : null)
+      : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'
@@ -197,8 +307,11 @@ function ProviderPanel({ provider, rpcCall }) {
               accounts.map(account => React.createElement(AccountCard, {
                 key: account.id,
                 account,
+                busy: probeBusy !== null,
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
+                onRetest: (id) => void runLimitAction('retest', id),
+                onReset: (id) => void runLimitAction('reset', id),
               }))));
 }
 

@@ -116,6 +116,65 @@ export interface RpcRefreshAccountResponse {
   error?: string
 }
 
+/**
+ * ========================================
+ * 限流标记重测 / 重置
+ * ========================================
+ */
+
+/** 单个模型的探测结果。 */
+export interface ProbeModelResult {
+  modelId: string
+  ok: boolean
+  /** 失败时的可读原因（限流文案 / HTTP 状态等）。 */
+  message?: string
+}
+
+/** 单个账号的重测结果。 */
+export interface ProbeAccountResult {
+  accountId: string
+  nickname?: string
+  /** 探测的模型数；0 表示该账号没有限流标记，无需重测。 */
+  tested: number
+  /** 确认恢复正常、标记已清除的模型。 */
+  cleared: string[]
+  /** 仍受限的模型。 */
+  stillLimited: ProbeModelResult[]
+  /** 探测过程中的异常（凭据不可用、网络失败等）。 */
+  error?: string
+}
+
+/** 重测单个账号（使用该账号自己的凭据发送探测消息）。 */
+export interface RpcRetestAccountRequest {
+  accountId: string
+}
+/** 重测该 provider 下的全部账号（**包含已停用账号**）。 */
+export interface RpcRetestAllRequest {
+  provider: string
+}
+/** 重测结果（单账号与全部共用同一响应结构）。 */
+export interface RpcRetestResponse {
+  accounts: ProbeAccountResult[]
+  /** 汇总：清除的限流标记总数。 */
+  clearedCount: number
+}
+
+/** 重置单个账号的限流标记（不测试，直接清除）。 */
+export interface RpcResetAccountRequest {
+  accountId: string
+}
+/** 重置该 provider 下全部账号的限流标记（**包含已停用账号**）。 */
+export interface RpcResetAllRequest {
+  provider: string
+}
+/** 重置结果。 */
+export interface RpcResetResponse {
+  /** 清除的限流标记总数。 */
+  clearedCount: number
+  /** 实际被清除了标记的账号数。 */
+  accountCount: number
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string

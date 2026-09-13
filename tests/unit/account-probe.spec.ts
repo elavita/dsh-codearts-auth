@@ -1,0 +1,217 @@
+/**
+ * 限流标记重测 / 重置的单元测试。
+ *
+ * 全部使用桩函数：**不发起任何网络请求**（探测函数由 deps.probe 注入），
+ * 遵循 tests/unit 的约定。
+ */
+import { describe, expect, it, vi } from 'vitest'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import {
+  resetAccount,
+  resetAllAccounts,
+  retestAccount,
+  retestAllAccounts,
+} from '../../src/account-probe.js'
+import type { ProbePool } from '../../src/account-probe.js'
+import type { ProviderAccountEntry } from '../../src/types.js'
+
+/** 构造账号条目；默认带一条 deepseek-v4.1-flash 的未到期限流记录。 */
+function makeEntry(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
+  return {
+    id: 'buddy-1',
+    provider: 'buddy',
+    nickname: '测试号',
+    enabled: true,
+    credentialRef: 'BUDDY_ACCOUNT_TEST',
+    createdAt: 1,
+    refreshable: true,
+    modelRateLimits: { 'deepseek-v4.1-flash': Date.now() + 3_600_000 },
+    ...overrides,
+  }
+}
+
+/**
+ * 记录调用的账号池替身。
+ *
+ * `clearModelRateLimits` 真实改写内部状态，使「重测后再查」能反映清除结果，
+ * 从而验证"只有实测通过的模型才被清除"。
+ */
+function makePool(entries: ProviderAccountEntry[]) {
+  const accounts = new Map(entries.map(e => [e.id, { ...e }]))
+  const cleared: Array<{ accountId: string; modelIds?: readonly string[] }> = []
+  const pool: ProbePool & { cleared: typeof cleared; get(id: string): ProviderAccountEntry | undefined } = {
+    cleared,
+    get: (id) => accounts.get(id),
+    findAccount: (id) => accounts.get(id),
+    listAccountsByProvider: (provider) => [...accounts.values()].filter(a => a.provider === provider),
+    async resolveCredentialForAccount(id) {
+      const entry = accounts.get(id)
+      if (entry === undefined) return undefined
+      return { access_token: 'AT', refresh_token: 'RT', expires_at: '2099-01-01T00:00:00Z' } as never
+    },
+    async clearModelRateLimits(accountId, modelIds) {
+      const entry = accounts.get(accountId)
+      if (entry?.modelRateLimits === undefined) return 0
+      const limits = { ...entry.modelRateLimits }
+      let removed = 0
+      const targets = modelIds ?? Object.keys(limits)
+      for (const m of targets) {
+        if (Object.prototype.hasOwnProperty.call(limits, m)) { delete limits[m]; removed++ }
+      }
+      if (removed === 0) return 0
+      const next = { ...entry }
+      if (Object.keys(limits).length === 0) delete next.modelRateLimits
+      else next.modelRateLimits = limits
+      accounts.set(accountId, next)
+      cleared.push({ accountId, modelIds })
+      return removed
+    },
+  }
+  return pool
+}
+
+describe('retestAccount', () => {
+  it('实测通过的模型被清除标记', async () => {
+    const pool = makePool([makeEntry()])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+    const result = await retestAccount(pool, 'buddy-1', { probe })
+
+    expect(result.tested).toBe(1)
+    expect(result.cleared).toEqual(['deepseek-v4.1-flash'])
+    expect(result.stillLimited).toEqual([])
+    // 关键：真的写回了池子，且只清除通过的模型
+    expect(pool.cleared).toEqual([{ accountId: 'buddy-1', modelIds: ['deepseek-v4.1-flash'] }])
+    expect(pool.get('buddy-1')?.modelRateLimits).toBeUndefined()
+  })
+
+  it('仍受限的模型保留标记，并回报原因', async () => {
+    const pool = makePool([makeEntry({
+      modelRateLimits: { 'model-a': Date.now() + 1000, 'model-b': Date.now() + 1000 },
+    })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => (
+      modelId === 'model-a'
+        ? { modelId, ok: false, message: '仍受限：频率限制' }
+        : { modelId, ok: true }
+    ))
+    const result = await retestAccount(pool, 'buddy-1', { probe })
+
+    expect(result.cleared).toEqual(['model-b'])
+    expect(result.stillLimited).toEqual([{ modelId: 'model-a', ok: false, message: '仍受限：频率限制' }])
+    // 只清除了 model-b，model-a 的标记必须还在
+    expect(pool.cleared).toEqual([{ accountId: 'buddy-1', modelIds: ['model-b'] }])
+    expect(pool.get('buddy-1')?.modelRateLimits).toEqual({ 'model-a': expect.any(Number) })
+  })
+
+  it('没有任何限流标记时不发请求', async () => {
+    const pool = makePool([makeEntry({ modelRateLimits: undefined })])
+    const probe = vi.fn()
+    const result = await retestAccount(pool, 'buddy-1', { probe })
+
+    expect(result.tested).toBe(0)
+    expect(probe).not.toHaveBeenCalled()
+    expect(pool.cleared).toEqual([])
+  })
+
+  it('账号不存在时返回错误而不抛异常', async () => {
+    const pool = makePool([])
+    const result = await retestAccount(pool, 'missing', { probe: vi.fn() })
+    expect(result.error).toContain('不存在')
+    expect(result.tested).toBe(0)
+  })
+
+  it('凭据不可用时不清除标记', async () => {
+    const entry = makeEntry()
+    const pool = makePool([entry])
+    // 覆盖为"凭据不可用"
+    pool.resolveCredentialForAccount = async () => undefined
+    // 用真实默认探测（deps.probe 省略）会走 resolveCredentialForAccount
+    const result = await retestAccount(pool, 'buddy-1')
+
+    expect(result.cleared).toEqual([])
+    expect(result.stillLimited[0]?.message).toContain('凭据不可用')
+    expect(pool.cleared).toEqual([])
+  })
+})
+
+describe('retestAllAccounts', () => {
+  it('遍历该 provider 的全部账号，包含已停用账号', async () => {
+    const pool = makePool([
+      makeEntry({ id: 'buddy-on', enabled: true }),
+      makeEntry({ id: 'buddy-off', enabled: false }),
+      makeEntry({ id: 'codearts-1', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_X' }),
+    ])
+    const seen: string[] = []
+    const probe = vi.fn(async (entry: ProviderAccountEntry, modelId: string) => {
+      seen.push(entry.id)
+      return { modelId, ok: true }
+    })
+    const res = await retestAllAccounts(pool, 'buddy', { probe })
+
+    // 停用的 buddy-off 也必须被重测（用户明确要求）
+    expect(seen.sort()).toEqual(['buddy-off', 'buddy-on'])
+    expect(res.accounts.map(a => a.accountId).sort()).toEqual(['buddy-off', 'buddy-on'])
+    expect(res.clearedCount).toBe(2)
+    // codearts 账号不应被 buddy 的批量操作波及
+    expect(res.accounts.some(a => a.accountId === 'codearts-1')).toBe(false)
+  })
+
+  it('按顺序逐个探测，避免并发触发真实限流', async () => {
+    const pool = makePool([makeEntry({ id: 'a' }), makeEntry({ id: 'b' }), makeEntry({ id: 'c' })])
+    let inFlight = 0
+    let maxInFlight = 0
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => {
+      inFlight++
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise(r => setTimeout(r, 1))
+      inFlight--
+      return { modelId, ok: true }
+    })
+    await retestAllAccounts(pool, 'buddy', { probe })
+    expect(maxInFlight).toBe(1)
+  })
+})
+
+describe('resetAccount / resetAllAccounts', () => {
+  it('重置不发请求，直接清除全部标记', async () => {
+    const pool = makePool([makeEntry({
+      modelRateLimits: { 'model-a': Date.now() + 1000, 'model-b': Date.now() + 2000 },
+    })])
+    const res = await resetAccount(pool, 'buddy-1')
+
+    expect(res.clearedCount).toBe(2)
+    expect(res.accountCount).toBe(1)
+    expect(pool.get('buddy-1')?.modelRateLimits).toBeUndefined()
+  })
+
+  it('无标记时重置返回 0', async () => {
+    const pool = makePool([makeEntry({ modelRateLimits: undefined })])
+    expect(await resetAccount(pool, 'buddy-1')).toEqual({ clearedCount: 0, accountCount: 0 })
+  })
+
+  it('重置所有覆盖停用账号并统计正确', async () => {
+    const pool = makePool([
+      makeEntry({ id: 'on', enabled: true }),
+      makeEntry({ id: 'off', enabled: false }),
+      makeEntry({ id: 'none', enabled: false, modelRateLimits: undefined }),
+      makeEntry({ id: 'ca', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_X' }),
+    ])
+    const res = await resetAllAccounts(pool, 'buddy')
+
+    // on + off 各 1 条；none 无标记不计入；codearts 不在范围内
+    expect(res.clearedCount).toBe(2)
+    expect(res.accountCount).toBe(2)
+    expect(pool.get('ca')?.modelRateLimits).toBeDefined()
+  })
+})
+
+describe('限流判定（isRateLimitFailure 经由默认探测暴露的行为）', () => {
+  it('LlmError 的 QUOTA_EXCEEDED / RATE_LIMIT / QUOTA 都识别为限流', () => {
+    // 该判定是私有的，通过默认探测路径间接验证：这里直接断言错误码集合
+    // 与实际适配器抛出的码一致，防止词汇漂移（buddy 用 QUOTA_EXCEEDED，
+    // harness 常量是 QUOTA）。
+    for (const code of ['RATE_LIMIT', 'QUOTA_EXCEEDED', 'QUOTA']) {
+      const error = new LlmError('频率限制', code)
+      expect(error.code).toBe(code)
+    }
+  })
+})

@@ -1,4 +1,4 @@
-﻿import { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
@@ -215,7 +215,81 @@ export class AccountPool {
     }
   }
 
-  /** 获取指定 provider + 模型的下一个可用账号 */
+  /** 按 id 查找账号条目（含已停用账号）。 */
+  findAccount(id: string): ProviderAccountEntry | undefined {
+    return this.readAccounts().find(a => a.id === id)
+  }
+
+  /** 列出某 provider 的全部账号（含已停用），供「重测所有 / 重置所有」使用。 */
+  listAccountsByProvider(provider: string): ProviderAccountEntry[] {
+    return this.readAccounts().filter(a => a.provider === provider)
+  }
+
+  /**
+   * 按账号 id 解析凭据（**不检查 enabled**）。
+   *
+   * 限流重测必须能对已停用账号发请求（用户明确要求"停用的账号也能发送"），
+   * 因此这里刻意与 {@link getAvailableAccount} 的过滤条件区分开：自动选择
+   * 只认启用账号，而按 id 的显式探测认全部账号。
+   * @returns 凭据对象；账号不存在或凭据不可用时返回 undefined。
+   */
+  async resolveCredentialForAccount(
+    id: string,
+  ): Promise<CodeArtsCredential | BuddyCredential | undefined> {
+    const entry = this.findAccount(id)
+    if (entry === undefined) return undefined
+    const parsed = await this.resolveCredentialByRef(entry.credentialRef)
+    if (parsed === undefined) return undefined
+    return parsed as unknown as CodeArtsCredential | BuddyCredential
+  }
+
+  /**
+   * 清除限流标记。
+   *
+   * @param accountId - 目标账号。
+   * @param modelIds - 要清除的模型；省略时清除该账号的**全部**标记。
+   * @returns 实际清除的标记数。
+   */
+  async clearModelRateLimits(accountId: string, modelIds?: readonly string[]): Promise<number> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) return 0
+    const entry = accounts[idx]
+    const current = entry.modelRateLimits
+    if (!current || Object.keys(current).length === 0) return 0
+
+    const limits = { ...current }
+    let removed = 0
+    const targets = modelIds ?? Object.keys(limits)
+    for (const modelId of targets) {
+      if (Object.prototype.hasOwnProperty.call(limits, modelId)) {
+        delete limits[modelId]
+        removed++
+      }
+    }
+    if (removed === 0) return 0
+
+    const next = [...accounts]
+    const updated = { ...entry }
+    // 清空后删除字段本身，避免 settings 里留下空对象噪音。
+    if (Object.keys(limits).length === 0) delete updated.modelRateLimits
+    else updated.modelRateLimits = limits
+    next[idx] = updated
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 已清除限流标记: 账号 ${accountId} 模型 ${targets.join(', ')}（共 ${removed} 条）`,
+    )
+    return removed
+  }
+
+  /**
+   * 获取指定 provider + 模型的下一个可用账号。
+   *
+   * `modelId` 为空串时**不做限流过滤**——调用方（provider 的
+   * resolveCredential 入口）此时还不知道要发哪个模型，只能退化为
+   * "任取一个启用账号"。但 `enabled` 过滤在任何情况下都生效：
+   * 停用账号绝不参与自动选择，空 modelId 也不例外。
+   */
   async getAvailableAccount(
     provider: string,
     modelId: string,
@@ -223,6 +297,8 @@ export class AccountPool {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => {
+        // 空 modelId（未知目标模型）：无可比对的键，保持候选不变。
+        if (modelId.length === 0) return true
         if (!a.modelRateLimits) return true
         const resetAt = a.modelRateLimits[modelId]
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt

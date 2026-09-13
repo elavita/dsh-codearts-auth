@@ -189,6 +189,113 @@ describe('AccountPool', () => {
     expect(all).toHaveLength(2)
   })
 
+  // ── 停用账号绝不参与自动选择 ──
+  // `getAvailableAccount` 是 provider 的凭据入口。停用只意味着"不自动参与
+  // 轮换"，因此任何情况下都不能返回停用账号——包括 modelId 为空串时
+  //（此时无法做限流过滤，最容易误把停用账号当成候选）。
+  describe('停用账号不参与自动选择', () => {
+    it('modelId 为空串时也不返回停用账号', async () => {
+      await ctx.credentials.set(credentialRef('CA_OFF'), JSON.stringify({ access_key_id: 'off' }))
+      await ctx.credentials.set(credentialRef('CA_ON'), JSON.stringify({ access_key_id: 'on' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'codearts-off', provider: 'codearts', enabled: false, credentialRef: 'CA_OFF',
+      }))
+      await pool.addAccount(makeMockAccount({
+        id: 'codearts-on', provider: 'codearts', enabled: true, credentialRef: 'CA_ON',
+      }))
+
+      const result = await pool.getAvailableAccount('codearts', '')
+      expect(result).not.toBeNull()
+      expect(result!.entry.id).toBe('codearts-on')
+    })
+
+    it('仅剩停用账号时返回 null（空 modelId 同样如此）', async () => {
+      await ctx.credentials.set(credentialRef('CA_OFF'), JSON.stringify({ access_key_id: 'off' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'codearts-off', provider: 'codearts', enabled: false, credentialRef: 'CA_OFF',
+      }))
+
+      expect(await pool.getAvailableAccount('codearts', '')).toBeNull()
+      expect(await pool.getAvailableAccount('codearts', 'deepseek-v4-flash')).toBeNull()
+    })
+
+    it('空 modelId 会跳过限流过滤，但启用账号仍被返回', async () => {
+      // 空 modelId 的语义：调用方还不知道目标模型，只能退化为"任取一个
+      // 启用账号"。此处记录该既有行为，避免日后被误改成"一并过滤"。
+      await ctx.credentials.set(credentialRef('CA_ON'), JSON.stringify({ access_key_id: 'on' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'codearts-on',
+        provider: 'codearts',
+        enabled: true,
+        credentialRef: 'CA_ON',
+        modelRateLimits: { 'deepseek-v4-flash': Date.now() + 3_600_000 },
+      }))
+
+      expect((await pool.getAvailableAccount('codearts', ''))?.entry.id).toBe('codearts-on')
+      expect(await pool.getAvailableAccount('codearts', 'deepseek-v4-flash')).toBeNull()
+    })
+  })
+
+  // ── 限流标记清除（重测/重置的底层能力）──
+  describe('clearModelRateLimits', () => {
+    it('清空后删除 modelRateLimits 字段本身，不留空对象', async () => {
+      await pool.addAccount(makeMockAccount({
+        modelRateLimits: { 'deepseek-v4-flash': Date.now() + 1000 },
+      }))
+      const removed = await pool.clearModelRateLimits('buddy-001')
+      expect(removed).toBe(1)
+      expect((await pool.listAccounts('buddy'))[0].modelRateLimits).toBeUndefined()
+    })
+
+    it('只清除指定的模型，其余保留', async () => {
+      const keep = Date.now() + 3_600_000
+      await pool.addAccount(makeMockAccount({
+        modelRateLimits: { 'model-a': Date.now() + 1000, 'model-b': keep },
+      }))
+      const removed = await pool.clearModelRateLimits('buddy-001', ['model-a'])
+      expect(removed).toBe(1)
+      expect((await pool.listAccounts('buddy'))[0].modelRateLimits).toEqual({ 'model-b': keep })
+    })
+
+    it('对无标记的账号返回 0 且不写盘', async () => {
+      await pool.addAccount(makeMockAccount())
+      expect(await pool.clearModelRateLimits('buddy-001')).toBe(0)
+    })
+
+    it('对不存在的账号返回 0', async () => {
+      expect(await pool.clearModelRateLimits('nonexistent')).toBe(0)
+    })
+  })
+
+  describe('resolveCredentialForAccount（含停用账号）', () => {
+    it('停用账号凭据仍可按 id 解析（重测需要）', async () => {
+      await ctx.credentials.set(credentialRef('CA_OFF'), JSON.stringify({ access_key_id: 'off' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'codearts-off', provider: 'codearts', enabled: false, credentialRef: 'CA_OFF',
+      }))
+
+      const credential = await pool.resolveCredentialForAccount('codearts-off')
+      expect(credential).toMatchObject({ access_key_id: 'off' })
+      // 但自动选择必须仍然排除它
+      expect(await pool.getAvailableAccount('codearts', '')).toBeNull()
+    })
+
+    it('账号不存在或凭据不可用时返回 undefined', async () => {
+      expect(await pool.resolveCredentialForAccount('missing')).toBeUndefined()
+      await pool.addAccount(makeMockAccount())  // 未设置凭据
+      expect(await pool.resolveCredentialForAccount('buddy-001')).toBeUndefined()
+    })
+  })
+
+  it('listAccountsByProvider 含停用账号', async () => {
+    await pool.addAccount(makeMockAccount({ id: 'on', enabled: true }))
+    await pool.addAccount(makeMockAccount({ id: 'off', enabled: false, credentialRef: 'BUDDY_ACCOUNT_T2' }))
+    await pool.addAccount(makeMockAccount({ id: 'ca', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C1' }))
+
+    expect(pool.listAccountsByProvider('buddy').map(a => a.id).sort()).toEqual(['off', 'on'])
+    expect(pool.findAccount('off')?.enabled).toBe(false)
+  })
+
   it('should handle removeAccount of non-existent account gracefully', async () => {
     await pool.removeAccount('nonexistent')
     const list = await pool.listAllAccounts()

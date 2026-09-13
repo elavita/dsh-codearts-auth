@@ -10,6 +10,7 @@
 | `buddy-models.e2e.spec.ts` | `DSH_BUDDY_E2E=1` + `DSH_BUDDY_E2E_CONFIRM=yes` | 用适配器拉取 CodeBuddy 模型并逐个发一次对话 |
 | `buddy-cache-probe.e2e.spec.ts` | `DSH_BUDDY_E2E=1` + `DSH_BUDDY_E2E_CONFIRM=yes` | 直连 `/v2/chat/completions`，发 3 组前缀做缓存对比 |
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
+| `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
 
 ## 不消耗模型积分
 
@@ -38,9 +39,46 @@ pnpm test:e2e:buddy-probe
 # ⚠️ 会消耗 CodeBuddy 积分
 pnpm test:e2e:buddy
 
+# ⚠️ 判定「限额重置」徽章是否属实（默认测 deepseek-v4.1-flash）
+pnpm test:e2e:buddy-ratelimit
+
 # ⚠️ 会消耗 CodeArts 积分
 pnpm test:e2e:codearts
 ```
+
+## 限流真实性判定
+
+`buddy-ratelimit-probe.e2e.spec.ts` 回答一个运维问题：Jet Hub 账号卡片显示
+「限额重置」时，**该账号此刻到底还受不受限**。
+
+徽章只比较 `modelRateLimits[model] > Date.now()`，是**历史事件的快照**，
+不代表此刻的真实可用性。用例把两件事分开测，以定位差异来源：
+
+- **A. 直连** `/v2/chat/completions`（绕过适配器与账号池）→ 服务端的真实答复；
+- **B. 适配器链路** → 插件实际会发生什么。
+
+判定：A 返回 200 且有正文即**未真限流**（徽章记录已失效）；A 返回
+429/6004 且含「频率限制」即**确实受限**。可设 `DSH_BUDDY_MODEL` 换被测模型。
+
+本地记录的重置时间取自信道错误体里的「将在 … UTC+8 重置」。服务端在重置
+时间到达前提前放行是常见的，因此**徽章显示超额使用、实际仍能正常回复**
+并不矛盾。
+
+## 设置页的「重测 / 重置」
+
+同一套判定也提供在设置页（Jet Hub）上，无需跑 e2e：
+
+| 按钮 | 行为 | 是否发请求 |
+|------|------|-----------|
+| **重测**（每个账号） | 对该账号每个限流标记的模型实发一条最小消息，正常返回才清除该标记 | 是（消耗额度） |
+| **重测所有**（面板标题） | 对全部账号（**含已停用**）执行上述重测，顺序逐个执行 | 是（消耗额度） |
+| **重置**（每个账号） | 直接清除该账号的全部限流标记 | 否 |
+| **重置所有**（面板标题） | 直接清除全部账号（含已停用）的限流标记 | 否 |
+
+实现见 `src/account-probe.ts`，RPC 端点为
+`account.retest` / `account.retestAll` / `account.reset` / `account.resetAll`。
+探测复用真实适配器（BuddyAdapter / CodeArtsAdapter）走完整请求链路，且
+**不传 accountPool**——避免「重测 A 账号」顺带污染其他账号的标记。
 
 ## 单元测试
 

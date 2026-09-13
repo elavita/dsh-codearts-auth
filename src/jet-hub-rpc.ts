@@ -4,7 +4,9 @@
  * 使用 DSH 的 connection.fetch.register() 模式注册 HTTP API 端点，
  * 与 dsh-im 的 registerManagementRpc 一致。
  * 通道名 jet-hub → 路径 /api/jet-hub
- * 端点方法：account.list / account.create / account.update / account.delete / account.refresh / login.poll
+ * 端点方法：account.list / account.create / account.update / account.delete /
+ *           account.refresh / account.retest / account.retestAll /
+ *           account.reset / account.resetAll / login.poll
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,6 +17,12 @@ import type { BuddyAuth } from './buddy-auth.js'
 import { fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
+import {
+  resetAccount,
+  resetAllAccounts,
+  retestAccount,
+  retestAllAccounts,
+} from './account-probe.js'
 import type {
   RpcListAccountsRequest,
   RpcListAccountsResponse,
@@ -26,6 +34,10 @@ import type {
   RpcDeleteAccountRequest,
   RpcRefreshAccountRequest,
   RpcRefreshAccountResponse,
+  RpcRetestAccountRequest,
+  RpcRetestAllRequest,
+  RpcResetAccountRequest,
+  RpcResetAllRequest,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -232,6 +244,39 @@ export function registerJetHubRpc(
         const resolved = await ctx.credentials.resolve(ref)
         if (!resolved) return { ok: true, value: { done: false } }
         return { ok: true, value: { done: true, success: true } }
+      }
+
+      // ── 限流标记：重测（发真实请求验证）──
+      // 标记只反映"上一次 429 时的快照"，服务端常在重置时间前提前放行。
+      // 重测发一次最小对话请求：正常返回才清除标记，仍受限则保留并回报原因。
+      case 'account.retest': {
+        const req = payload as RpcRetestAccountRequest
+        const account = await retestAccount(pool, req.accountId)
+        return {
+          ok: true,
+          value: { accounts: [account], clearedCount: account.cleared.length },
+        }
+      }
+
+      // 重测该 provider 下的全部账号。**包含已停用账号**——用户明确要求
+      // 停用账号也能重测（停用只影响自动选择，不影响手动排查）。
+      case 'account.retestAll': {
+        const req = payload as RpcRetestAllRequest
+        const value = await retestAllAccounts(pool, req.provider)
+        return { ok: true, value }
+      }
+
+      // ── 限流标记：重置（不发请求，直接清除）──
+      case 'account.reset': {
+        const req = payload as RpcResetAccountRequest
+        const value = await resetAccount(pool, req.accountId)
+        return { ok: true, value }
+      }
+
+      case 'account.resetAll': {
+        const req = payload as RpcResetAllRequest
+        const value = await resetAllAccounts(pool, req.provider)
+        return { ok: true, value }
       }
 
       default:
