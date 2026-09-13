@@ -221,6 +221,46 @@ describe('buddy model config parsing', () => {
     ])
   })
 
+  it('parses the capability fields the adapter declares models from', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['deepseek-v4.1-flash', 'glm-5.1'] }],
+        models: [
+          {
+            id: 'deepseek-v4.1-flash',
+            maxInputTokens: 1_000_000,
+            supportsImages: true,
+            reasoning: { canDisableThinking: true, defaultEffort: 'high', supportedEfforts: ['low', 'high', 'max'] },
+          },
+          // 只有固定 effort 的模型没有 supportedEfforts → 不暴露等级选择器
+          { id: 'glm-5.1', maxInputTokens: 200_000, supportsImages: true, reasoning: { effort: 'medium' } },
+        ],
+      },
+    })
+    expect(models).toEqual([
+      {
+        id: 'deepseek-v4.1-flash',
+        name: 'deepseek-v4.1-flash',
+        contextWindow: 1_000_000,
+        supportsImages: true,
+        reasoningEfforts: ['low', 'high', 'max'],
+        defaultReasoningEffort: 'high',
+      },
+      { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true },
+    ])
+  })
+
+  it('preserves an explicit supportsImages=false and omits undisclosed fields', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['plain', 'bare'] }],
+        models: [{ id: 'plain', supportsImages: false }, { id: 'bare' }],
+      },
+    })
+    expect(models[0]?.supportsImages).toBe(false)
+    expect(models[1]).toEqual({ id: 'bare', name: 'bare' })
+  })
+
   it('returns an empty list for malformed payloads', () => {
     expect(parseModelsFromConfig(null)).toEqual([])
     expect(parseModelsFromConfig({})).toEqual([])

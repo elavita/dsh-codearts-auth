@@ -20,7 +20,7 @@ import {
   type BuddyLoginFlowOptions,
 } from './buddy-oauth.js'
 import { RefreshScheduler } from './refresh.js'
-import type { BuddyCredential } from './buddy.js'
+import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { AccountPool } from './account-pool.js'
 
 /** Buddy 登录结果存储所用的凭据引用。 */
@@ -306,7 +306,7 @@ export class BuddyAuth extends Service {
    *
    * 优先使用账号池中的可用账号；无账号池或池为空时回退到固定凭据 ref。
    */
-  async fetchModels(pool?: AccountPool): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
+  async fetchModels(pool?: AccountPool): Promise<BuddyRemoteModel[]> {
     // 优先账号池
     if (pool) {
       const available = await pool.getAvailableAccount('buddy', '')

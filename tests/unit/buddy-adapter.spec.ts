@@ -1,8 +1,8 @@
-﻿import { LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
 import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL } from '../../src/buddy-adapter.js'
-import type { BuddyCredential } from '../../src/buddy.js'
+import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -43,7 +43,8 @@ function makeAdapter(overrides: {
   /** refresh() 之后 resolveCredential 应返回的值；默认刷新成功（恢复为有效凭据）。 */
   postRefreshCredential?: BuddyCredential | undefined
   fetchImpl?: typeof fetch
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
+  fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -57,6 +58,7 @@ function makeAdapter(overrides: {
     },
     fetchImpl,
     ...overrides.fetchRemoteModels !== undefined ? { fetchRemoteModels: overrides.fetchRemoteModels } : {},
+    ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
   })
 }
 
@@ -135,6 +137,69 @@ describe('BuddyAdapter', () => {
     expect(resolved.context).toBeUndefined()
   })
 
+  // ── 图片能力声明 ──
+  // 权威来源是 /v3/config 的 supportsImages。此前硬编码 ['text']，会话控制器
+  // 直接在附件准入处拒绝图片（MODEL_DOES_NOT_SUPPORT_IMAGES），用户表现为
+  // "设置里需要声明才能用图片"。
+  describe('图片能力声明', () => {
+    it('远端 supportsImages=true 时声明 image 模态', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'vision', name: 'V', supportsImages: true }],
+      })
+      expect((await adapter.resolveModel('buddy', 'vision')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    it('远端显式 supportsImages=false 时保持 text-only', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'plain', name: 'P', supportsImages: false }],
+      })
+      expect((await adapter.resolveModel('buddy', 'plain')).inputModalities).toEqual(['text'])
+    })
+
+    it('远端未下发该字段时回退静态表', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
+      })
+      expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
+    })
+  })
+
+  // ── 思考强度声明 ──
+  // composer 的模型选择器读取 resolveModel().reasoning.efforts；不声明该字段
+  // 就显示"当前模型未提供推理等级"。
+  describe('思考强度声明', () => {
+    it('按远端 supportedEfforts 暴露等级与默认值', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{
+          id: 'deepseek-v4.1-flash',
+          name: 'DS',
+          reasoningEfforts: ['low', 'high', 'max'],
+          defaultReasoningEffort: 'high',
+        }],
+      })
+      const resolved = await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')
+      expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['low', 'high', 'max'])
+      expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['Low', 'High', 'Max'])
+      expect(resolved.reasoning?.defaultEffort).toBe('high')
+    })
+
+    it('远端未下发等级时回退静态表', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'deepseek-v4-pro', name: 'DS' }],
+      })
+      expect((await adapter.resolveModel('buddy', 'deepseek-v4-pro')).reasoning?.efforts.map((e) => e.id))
+        .toEqual(['low', 'high', 'xhigh'])
+    })
+
+    it('无可选等级的模型不暴露选择器', async () => {
+      // glm-5.1 远端只给固定 effort，没有 supportedEfforts。
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'glm-5.1', name: 'GLM' }],
+      })
+      expect((await adapter.resolveModel('buddy', 'glm-5.1')).reasoning).toBeUndefined()
+    })
+  })
+
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
   // registration.adapter.prepareCall()，而本仓库链接的副本（0.1.0-rc.6）
   // 的 LlmAdapter 基类没有该方法——缺少时每轮请求都以
@@ -147,7 +212,7 @@ describe('BuddyAdapter', () => {
       provider: 'buddy',
       id: 'hy4-preview',
       context: { contextWindow: 1_000_000 },
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
     })
     expect(typeof call.stream).toBe('function')
   })
@@ -223,6 +288,80 @@ describe('BuddyAdapter credential handling', () => {
     expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
     expect(seen!.get('X-Product-Code')).toBe('codebuddy')
     expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/1.106.1')
+  })
+
+  /** 抓取一次 stream() 实际发出的请求体；overrides 同时用于 adapter 与请求。 */
+  async function captureBody(overrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    let body: Record<string, unknown> = {}
+    const adapter = makeAdapter({
+      ...overrides,
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+      ...overrides,
+    } as never)
+    return body
+  }
+
+  // 实测：reasoning_effort=low/high/max 会显著改变返回的 reasoning_content
+  // 长度，是服务端真实生效的参数。
+  it('stream forwards a supported reasoning effort as reasoning_effort', async () => {
+    expect(await captureBody({ reasoningEffort: 'max' })).toMatchObject({ reasoning_effort: 'max' })
+  })
+
+  it('stream omits reasoning_effort when none is selected or it is unsupported', async () => {
+    expect(await captureBody()).not.toHaveProperty('reasoning_effort')
+    // 会话历史里可能残留切换模型前的旧等级（如 glm-5.2 的 xhigh），
+    // 直接透传会让服务端拒绝整个请求。
+    expect(await captureBody({ reasoningEffort: 'xhigh' })).not.toHaveProperty('reasoning_effort')
+  })
+
+  // CodeBuddy 只接受 OpenAI 多模态 parts 形态的图片；
+  // {type:'image'} 会被服务端以 `unsupported content type ... image` 400。
+  it('stream sends user images as inline image_url parts', async () => {
+    const body = await captureBody({
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+        ],
+      }],
+    })
+    const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
+    expect(user.content).toEqual([
+      { type: 'text', text: 'what is this?' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ])
+  })
+
+  it('stream rejects images for a model that declares text-only', async () => {
+    const adapter = makeAdapter({
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+      fetchRemoteModels: async () => [{ id: DEFAULT_MODEL, name: 'M', supportsImages: false }],
+      fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+  })
+
+  it('stream keeps image-free requests on the plain string content path', async () => {
+    // 无图请求的线上格式必须不变，否则整体破坏前缀缓存命中。
+    const body = await captureBody({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })
+    const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
+    expect(user.content).toBe('hello')
   })
 })
 

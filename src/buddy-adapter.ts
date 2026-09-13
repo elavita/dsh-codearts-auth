@@ -13,6 +13,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   attributionHeaders,
   LlmAdapter, LlmError,
+  ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
@@ -28,7 +29,7 @@ import {
   HTTP_HEADER_PRODUCT_CODE,
   credentialExpiresAtMs,
 } from './buddy.js'
-import type { BuddyCredential } from './buddy.js'
+import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 export const CHAT_API_BASE = 'https://copilot.tencent.com/v2'
@@ -79,6 +80,60 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['minimax-m3', 512_000],
 ])
 
+/**
+ * 模型是否接受图片输入（远端 /v3/config `supportsImages` 不可用时的兜底）。
+ *
+ * 权威来源是远端下发的 `supportsImages`；此表只在远端未下发该字段时使用。
+ * 实测（2026-09 /v3/config）craft agent 的对话模型全部 supportsImages=true，
+ * 故这里列出全部对话模型，非对话模型（codewise-* 等）不在此表内。
+ */
+const IMAGE_MODELS: ReadonlySet<string> = new Set([
+  'deepseek-v4-flash',
+  'deepseek-v4.1-flash',
+  'deepseek-v4-pro',
+  'hy4-preview',
+  'hy4-preview-x',
+  'hy3',
+  'hy3-x',
+  'glm-5.3',
+  'glm-5.3-flash',
+  'glm-5.2',
+  'glm-5.1',
+  'glm-5v-turbo',
+  'kimi-k3-1',
+  'kimi-k2.7',
+  'kimi-k2.6',
+  'minimax-m3',
+])
+
+/**
+ * 各模型可选的思考等级（远端 `reasoning.supportedEfforts` 不可用时的兜底）。
+ *
+ * 只列出**可枚举**等级的模型；仅有固定默认 effort 的模型（glm-5.1/kimi-*）
+ * 不在此表内，即不向用户暴露等级选择器。
+ */
+const REASONING_EFFORTS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['deepseek-v4-flash', ['low', 'high', 'max']],
+  ['deepseek-v4.1-flash', ['low', 'high', 'max']],
+  ['deepseek-v4-pro', ['low', 'high', 'xhigh']],
+  ['hy4-preview', ['high']],
+  ['hy4-preview-x', ['high']],
+  ['hy3', ['low', 'high']],
+  ['hy3-x', ['low', 'high']],
+  ['glm-5.3', ['low', 'high', 'max']],
+  ['glm-5.3-flash', ['low', 'high', 'max']],
+  ['glm-5.2', ['high', 'xhigh']],
+])
+
+/** 思考等级 id → 展示名（对齐 DeepSeek 官方 provider 的命名）。 */
+const EFFORT_NAMES: Readonly<Record<string, string>> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max',
+}
+
 export interface BuddyAdapterOptions {
   credentialRef: CredentialRef
   /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
@@ -87,8 +142,15 @@ export interface BuddyAdapterOptions {
   resolveCredential: () => Promise<BuddyCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
-  /** 动态拉取远端模型列表（含上下文窗口，若远端下发）；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
+  /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
+  fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+  /**
+   * 读取一张图片的原始字节（图片输入必需）。
+   *
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`；未提供时收到图片会报
+   * UNSUPPORTED_CONTENT，而不是把图片静默丢掉。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
@@ -117,7 +179,10 @@ function contentToText(content: unknown): string {
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
  */
-function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
+function serializeMessages(
+  messages: readonly { role: string; content: unknown }[],
+  imageUrls?: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
 
   // ── 孤儿工具调用清理（会话续命的关键）──
@@ -171,7 +236,13 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    // 含图片时 content 升级为 OpenAI 多模态 parts（CodeBuddy 唯一接受的图片
+    // 形态；{type:'image'} 会以 `unsupported content type ... image` 400）。
+    const parts = imageUrls === undefined || imageUrls.size === 0
+      ? undefined
+      : userContentParts(content, imageUrls)
+    if (parts !== undefined) wire.push({ role: 'user', content: parts })
+    else if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
@@ -258,6 +329,51 @@ function isTransportError(error: unknown): boolean {
   return false
 }
 
+/**
+ * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
+ * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; text?: unknown; attachment?: { attachmentId?: unknown } }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+      continue
+    }
+    if (block.type === 'image') {
+      hasImage = true
+      const url = block.attachment?.attachmentId === undefined
+        ? undefined
+        : imageUrls.get(String(block.attachment.attachmentId))
+      // 解析不到字节时留占位文本，而不是静默吞掉整张图。
+      parts.push(url === undefined
+        ? { type: 'text', text: '[image unavailable]' }
+        : { type: 'image_url', image_url: { url } })
+    }
+  }
+  return hasImage && parts.length > 0 ? parts : undefined
+}
+
+/** 收集 user 消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
+function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
+    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
+      refs.set(block.attachment.attachmentId, block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
+  }
+}
+
 /** buddy (腾讯 CodeBuddy) 模型适配器。使用 Bearer access_token 鉴权。 */
 export class BuddyAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
@@ -267,7 +383,9 @@ export class BuddyAdapter extends LlmAdapter {
    */
   private readonly sessionId: string
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string }> | undefined
+  private remoteModels: BuddyRemoteModel[] | undefined
+  /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
+  private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
   private remoteContextWindows: ReadonlyMap<string, number> = new Map()
 
@@ -307,9 +425,10 @@ export class BuddyAdapter extends LlmAdapter {
       const models = await this.options.fetchRemoteModels()
       if (models.length > 0) {
         this.remoteModels = models
-        // /v3/config data.models[].maxInputTokens 是权威来源（对齐 Rust
-        // TUI buddy_context_limits 注入逻辑）：远端下发的上下文窗口优先
-        // 于 CONTEXT_WINDOWS 静态 fallback 表。
+        // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
+        // 注入逻辑）：远端下发的上下文窗口优先于 CONTEXT_WINDOWS 静态 fallback 表；
+        // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
         this.remoteContextWindows = new Map(
           models.filter((model) => model.contextWindow !== undefined).map((model) => [model.id, model.contextWindow as number]),
         )
@@ -319,11 +438,25 @@ export class BuddyAdapter extends LlmAdapter {
     }
   }
 
+  /** 模型接受的输入模态：远端 supportsImages 优先，静态表兜底。 */
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+    const supportsImages = this.remoteMeta.get(model)?.supportsImages ?? IMAGE_MODELS.has(model)
+    return supportsImages ? ['text', 'image'] : ['text']
+  }
+
+  /** 模型可选的思考等级：远端 supportedEfforts 优先，静态表兜底。 */
+  private effortsFor(model: string): readonly string[] {
+    return this.remoteMeta.get(model)?.reasoningEfforts ?? REASONING_EFFORTS.get(model) ?? []
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
     return source.map((model) => ({
-      provider: PROVIDER, id: model.id, name: model.name, inputModalities: ['text'],
+      provider: PROVIDER,
+      id: model.id,
+      name: model.name,
+      inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
 
@@ -332,8 +465,29 @@ export class BuddyAdapter extends LlmAdapter {
     // 优先远端 maxInputTokens，其次静态 fallback 表（对齐 Rust
     // context_limit_for_model 的两级查找）。
     const contextWindow = this.remoteContextWindows.get(model) ?? CONTEXT_WINDOWS.get(model)
-    const resolved: LlmResolvedModelInfo = { provider, id: model, name: model }
+    const resolved: LlmResolvedModelInfo = {
+      provider,
+      id: model,
+      name: model,
+      inputModalities: this.inputModalitiesFor(model),
+    }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
+    // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
+    // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
+    // "当前模型未提供推理等级"。
+    const efforts = this.effortsFor(model)
+    if (efforts.length > 0) {
+      const remoteDefault = this.remoteMeta.get(model)?.defaultReasoningEffort
+      resolved.reasoning = {
+        efforts: efforts.map((id) => ({
+          id: ReasoningEffortId(id),
+          name: EFFORT_NAMES[id] ?? id,
+        })),
+        ...remoteDefault !== undefined && efforts.includes(remoteDefault)
+          ? { defaultEffort: ReasoningEffortId(remoteDefault) }
+          : {},
+      }
+    }
     return resolved
   }
 
@@ -350,7 +504,7 @@ export class BuddyAdapter extends LlmAdapter {
     signal?: AbortSignal,
   ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
     return {
-      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] as const },
+      model: await this.resolveModel(provider, model, signal),
       stream: (options: GenerateOptions) => this.stream(options),
     }
   }
@@ -384,8 +538,34 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
 
+    // 能力判定（图片 / 思考强度）必须有远端目录在手：两者都以 /v3/config
+    // 下发值为权威，而该拉取是懒加载的。缺了这一步，远端显式 false 会被
+    // 静态兜底表覆盖，合法的思考等级也会被误判为不支持而丢弃。
+    await this.ensureRemoteModels()
+
     // 2. 序列化消息
-    const messages = serializeMessages(options.messages)
+    // 图片：读原始字节并以内联 data URL 发出——这是 CodeBuddy 唯一接受的
+    // 图片形态（{type:'image'} 会被服务端 400 拒绝）。
+    const imageRefs = new Map<string, unknown>()
+    for (const message of options.messages) {
+      if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+    }
+    let imageUrls: Map<string, string> | undefined
+    if (imageRefs.size > 0) {
+      if (!this.inputModalitiesFor(options.model).includes('image')) {
+        throw new LlmError(`buddy: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT')
+      }
+      if (this.options.readImage === undefined) {
+        throw new LlmError('buddy: image input requires the attachment service.', 'UNSUPPORTED_CONTENT')
+      }
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        const image = await this.options.readImage(ref)
+        if (image === undefined) continue
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+      }
+    }
+    const messages = serializeMessages(options.messages, imageUrls)
     if (options.system !== undefined && options.system.length > 0) {
       messages.unshift({ role: 'system', content: options.system })
     }
@@ -414,6 +594,12 @@ export class BuddyAdapter extends LlmAdapter {
     if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
+    // 思考强度：composer 选中的等级透传为 `reasoning_effort`（实测
+    // low/high/max 会显著改变返回的 reasoning_content 长度，服务端真实生效）。
+    // 只在该模型确实支持该等级时才发，否则服务端会因非法参数 400。
+    if (options.reasoningEffort !== undefined && this.effortsFor(options.model).includes(options.reasoningEffort)) {
+      bodyObj.reasoning_effort = options.reasoningEffort
+    }
     const body = JSON.stringify(bodyObj)
 
     // 4. 发送请求（401/403 时刷新一次凭据后重试）

@@ -404,20 +404,26 @@ export function displayNameForModel(id: string): string {
   return MODEL_DISPLAY_NAMES[id] ?? id
 }
 
-/** /v3/config 解析出的单个模型：id、展示名与可选的上下文窗口。 */
+/** /v3/config 解析出的单个模型：id、展示名与远端声明的能力。 */
 export interface BuddyRemoteModel {
   id: string
   name: string
   /** 上下文窗口（data.models[].maxInputTokens，模型自身配置）；远端未下发时缺省。 */
   contextWindow?: number
+  /** 是否接受图片输入（data.models[].supportsImages）。 */
+  supportsImages?: boolean
+  /** 可选思考等级（data.models[].reasoning.supportedEfforts）；无等级可选的模型缺省。 */
+  reasoningEfforts?: string[]
+  /** 默认思考等级（data.models[].reasoning.defaultEffort）。 */
+  defaultReasoningEffort?: string
 }
 
 /**
  * 从 /v3/config 响应解析模型列表（craft agent 的 models）。
  *
  * 响应结构：{data: {agents: [{name: "craft", models: ["auto", "hy4-preview", ...]}, ...],
- *                     models: [{id, name, maxInputTokens, maxOutputTokens, ...}]}}
- * craft agent 的 models 是字符串 id 列表；各模型的上下文窗口从 data.models[].maxInputTokens
+ *                     models: [{id, name, maxInputTokens, supportsImages, reasoning: {...}}]}}
+ * craft agent 的 models 是字符串 id 列表；各模型的上下文窗口与能力从 data.models[]
  * 按 id 查找（权威来源，对齐 deveco-code-rust parse_models_from_config）。
  * 排除 "auto"（自动选择，非真实模型）。解析失败时返回空数组，调用方回退内置列表。
  */
@@ -425,15 +431,13 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   if (typeof body !== 'object' || body === null) return []
   const data = (body as Record<string, unknown>).data
   if (typeof data !== 'object' || data === null) return []
-  // data.models: id → maxInputTokens（仅保留正数，与 Rust 端一致）
-  const contextById = new Map<string, number>()
+  // data.models: id → 远端声明的模型元数据
+  const metaById = new Map<string, Record<string, unknown>>()
   if (Array.isArray((data as Record<string, unknown>).models)) {
     for (const model of (data as Record<string, unknown>).models as unknown[]) {
       if (typeof model !== 'object' || model === null) continue
       const record = model as Record<string, unknown>
-      if (typeof record.id !== 'string') continue
-      const limit = record.maxInputTokens
-      if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) contextById.set(record.id, limit)
+      if (typeof record.id === 'string') metaById.set(record.id, record)
     }
   }
   const agents = (data as Record<string, unknown>).agents
@@ -447,14 +451,37 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
     const parsed: BuddyRemoteModel[] = []
     for (const model of models) {
       if (typeof model !== 'string' || model === 'auto') continue
-      const contextWindow = contextById.get(model)
-      parsed.push({
-        id: model,
-        name: displayNameForModel(model),
-        ...contextWindow !== undefined ? { contextWindow } : {},
-      })
+      parsed.push({ id: model, name: displayNameForModel(model), ...parseModelMeta(metaById.get(model)) })
     }
     return parsed
   }
   return []
+}
+
+/**
+ * 提取单个 data.models[] 条目的上下文窗口与对话能力。
+ *
+ * 上下文窗口只保留正数（与 Rust 端一致）。能力字段只在远端**显式**下发时保留：
+ * 缺失即 undefined，交由适配器的静态兜底表决定，而不是猜成 false。
+ */
+function parseModelMeta(record: Record<string, unknown> | undefined): Omit<BuddyRemoteModel, 'id' | 'name'> {
+  if (record === undefined) return {}
+  const meta: Omit<BuddyRemoteModel, 'id' | 'name'> = {}
+  const limit = record.maxInputTokens
+  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) meta.contextWindow = limit
+  if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
+  const reasoning = record.reasoning
+  if (typeof reasoning === 'object' && reasoning !== null) {
+    const fields = reasoning as Record<string, unknown>
+    // supportedEfforts 是**可枚举**的等级列表，只在模型真正支持多等级时下发；
+    // 只有单一默认 effort 的模型（glm-5.1/kimi-*）此处缺省，不暴露等级选择器。
+    if (Array.isArray(fields.supportedEfforts)) {
+      const efforts = fields.supportedEfforts.filter((e): e is string => typeof e === 'string' && e.length > 0)
+      if (efforts.length > 0) meta.reasoningEfforts = efforts
+    }
+    if (typeof fields.defaultEffort === 'string' && fields.defaultEffort.length > 0) {
+      meta.defaultReasoningEffort = fields.defaultEffort
+    }
+  }
+  return meta
 }

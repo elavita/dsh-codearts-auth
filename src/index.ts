@@ -216,6 +216,20 @@ export function apply(ctx: Context): void {
     },
     refresh: () => buddy.refresh(),
     fetchRemoteModels: () => buddy.fetchModels(pool),
+    // 图片附件：桥接 ctx.attachments，把持久化图片读成原始字节供适配器内联。
+    // 用 ctx.get 而非 inject —— 附件服务缺失时 provider 仍可正常加载，
+    // 只是收到图片时报 UNSUPPORTED_CONTENT。
+    readImage: async (attachment) => {
+      const attachments = ctx.get('attachments') as
+        { readImage?: (ref: never) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> } | undefined
+      if (attachments?.readImage === undefined) return undefined
+      try {
+        const stored = await attachments.readImage(attachment as never)
+        return { data: stored.data, mediaType: stored.ref.mediaType }
+      } catch {
+        return undefined
+      }
+    },
     accountPool: pool,
   })
 

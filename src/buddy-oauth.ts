@@ -45,7 +45,7 @@ import {
   parseModelsFromConfig,
   parseTokenData,
 } from './buddy.js'
-import type { BuddyAccount, BuddyCredential, BuddyToken } from './buddy.js'
+import type { BuddyAccount, BuddyCredential, BuddyRemoteModel, BuddyToken } from './buddy.js'
 
 /** 在浏览器中打开登录 URL；永不抛出（失败时打印 URL 供手动打开）。 */
 export type OpenBrowser = (url: string) => void
@@ -315,7 +315,7 @@ export async function fetchModels(
   credential: BuddyCredential,
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
-): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
+): Promise<BuddyRemoteModel[]> {
   if (credential.access_token.length === 0) return []
   const url = `${API_ENDPOINT}${CONFIG_PATH}`
   const headers: Record<string, string> = {
