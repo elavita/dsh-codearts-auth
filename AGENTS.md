@@ -11,15 +11,18 @@
 本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy）两个 LLM provider 路由。
 
 - **包名**：`dsh-codearts-auth`
-- **入口**：`lib/index.js`
-- **构建**：`pnpm build`（TypeScript 编译）
+- **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
+- **构建**：`pnpm build:all`（`tsc` 编译宿主侧 + `esbuild` 打包客户端）
 - **语言**：TypeScript
 - **许可**：MIT
 
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
-- **构建系统**：TypeScript `tsc`，编译输出到 `lib/` 目录
+- **构建系统**：宿主侧用 TypeScript `tsc` 编译到 `lib/`；客户端 bundle 用
+  `esbuild`（`plugin-src/client/build.mjs`）打包到 `lib/client/jet-hub.js`。
+  两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证
+  git 安装时两侧产物齐全。
 - **测试**：Vitest（单元测试 + E2E 端到端测试）
   - `pnpm test` — 单元测试（快速，无网络）
   - `pnpm test:e2e` — 端到端测试（需要线上端点）
@@ -30,8 +33,9 @@
 
 | 路径 | 说明 |
 |-------|------|
-| `src/` | TypeScript 源码目录 |
-| `lib/` | 编译产物（已 gitignore） |
+| `src/` | TypeScript 源码目录（宿主侧） |
+| `plugin-src/client/` | Jet Hub 客户端源码（esbuild 打包） |
+| `lib/` | 编译产物（已 gitignore；含 `lib/client/jet-hub.js`） |
 | `tests/unit/` | 单元测试 |
 | `cordis.patch.yml` | DSH bundle 补丁 |
 | `tsconfig.json` | TypeScript 配置 |
@@ -61,9 +65,9 @@
 ### 新增功能
 
 1. 确定所属模块（auth 服务 / 命令 / provider）
-2. 在 `src/` 对应文件中实现逻辑
+2. 在 `src/` 对应文件中实现逻辑（客户端 UI 改 `plugin-src/client/`）
 3. 添加单元测试覆盖
-4. 执行 `pnpm build` 编译
+4. 执行 `pnpm build:all` 编译（host + client 两侧）
 5. 执行 `pnpm test` 验证
 6. 更新文档
 
