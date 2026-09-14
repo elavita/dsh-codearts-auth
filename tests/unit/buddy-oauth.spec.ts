@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   RefreshTokenExpiredError,
+  decorateLoginUrl,
   fetchAuthState,
   fetchModels,
   getAccount,
@@ -8,6 +9,7 @@ import {
   refreshToken,
   runBuddyLoginFlow,
 } from '../../src/buddy-oauth.js'
+import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 import type { BuddyCredential } from '../../src/buddy.js'
 
 const STATE = 'state-abc'
@@ -185,6 +187,97 @@ describe('buddy refreshToken', () => {
     await expect(refreshToken(makeCredential({ refresh_token: '' }), fetcher)).rejects.toBeInstanceOf(RefreshTokenExpiredError)
     expect(fetcher).not.toHaveBeenCalled()
   })
+
+  // 回归（Task 3 审查遗留）：refresh 请求此前硬编码 CodeBuddy 的 UA。
+  // 两个内置产品的 userAgent 字面量暂时相同，无法观测该行为，故注入自定义 UA。
+  it('续期请求使用传入 product 的 User-Agent', async () => {
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0,
+        data: { accessToken: 'AT2', refreshToken: 'RT2', expiresAt: '', refreshExpiresAt: '', tokenType: 'Bearer', scope: '', domain: '' },
+      }), { status: 200 }),
+    }])
+    await refreshToken(makeCredential(), fetcher, undefined, custom)
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    const headers = init.headers as Record<string, string>
+    expect(headers['User-Agent']).toBe('WorkBuddy/7.7.7')
+    expect(headers['X-Refresh-Token']).toBe('RT')
+  })
+
+  it('默认续期请求仍使用 CodeBuddy 的 User-Agent', async () => {
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0,
+        data: { accessToken: 'AT2', refreshToken: 'RT2', expiresAt: '', refreshExpiresAt: '', tokenType: 'Bearer', scope: '', domain: '' },
+      }), { status: 200 }),
+    }])
+    await refreshToken(makeCredential(), fetcher)
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['User-Agent']).toBe(CODEBUDDY.userAgent)
+  })
+})
+
+describe('登录轮询的产品身份标识', () => {
+  it('loopGetToken 使用传入 product 的 User-Agent', async () => {
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0,
+        data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: '' },
+      }), { status: 200 }),
+    }])
+    await loopGetToken(STATE, { fetcher, pollIntervalMs: 0, product: custom })
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['User-Agent']).toBe('WorkBuddy/7.7.7')
+  })
+
+  it('getAccount 使用传入 product 的 User-Agent', async () => {
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { uid: 'u1', nickname: 'n', enterpriseId: '', type: 'personal' },
+      }), { status: 200 }),
+    }])
+    const token = {
+      accessToken: 'AT', refreshToken: 'RT', expiresAt: '', refreshExpiresAt: '', tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com',
+    }
+    await getAccount(STATE, token, { fetcher, pollIntervalMs: 0, product: custom })
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['User-Agent']).toBe('WorkBuddy/7.7.7')
+  })
+
+  it('runBuddyLoginFlow 把产品传给 token 与 account 两步轮询', async () => {
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/auth/state'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=workbuddy&state=S' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/auth/token'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: '' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/login/account'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u', nickname: 'n', type: 'personal' } }), { status: 200 }),
+      },
+    ])
+    await runBuddyLoginFlow({ fetcher, pollIntervalMs: 0, product: custom, openBrowser: () => {} })
+    const calls = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls
+    const tokenCall = calls.find(([url]) => url.includes('/auth/token'))!
+    const accountCall = calls.find(([url]) => url.includes('/login/account'))!
+    expect((tokenCall[1].headers as Record<string, string>)['User-Agent']).toBe('WorkBuddy/7.7.7')
+    expect((accountCall[1].headers as Record<string, string>)['User-Agent']).toBe('WorkBuddy/7.7.7')
+  })
 })
 
 describe('buddy fetchModels', () => {
@@ -205,6 +298,126 @@ describe('buddy fetchModels', () => {
     const fetcher = routeFetch([{ when: () => true, respond: () => new Response('nope', { status: 500 }) }])
     expect(await fetchModels(makeCredential({ access_token: '' }), fetcher)).toEqual([])
     expect(await fetchModels(makeCredential(), fetcher)).toEqual([])
+  })
+
+  // 回归（Task 3 审查遗留）：默认仍发 codebuddy 身份，传 WorkBuddy 时必须
+  // 换成 workbuddy —— 否则 WorkBuddy 会拿 CodeBuddy 的产品码请求 /v3/config。
+  it('默认以 codebuddy 身份请求 /v3/config', async () => {
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: [] }] } }), { status: 200 }),
+    }])
+    await fetchModels(makeCredential(), fetcher)
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    const headers = init.headers as Record<string, string>
+    expect(headers['X-Product-Code']).toBe('codebuddy')
+    expect(headers['User-Agent']).toBe('CodeBuddyIDE/1.106.1')
+    // X-Product 是部署类型，两个产品共用 SaaS。
+    expect(headers['X-Product']).toBe('SaaS')
+  })
+
+  it('传入 WorkBuddy 时请求带 X-Product-Code: workbuddy', async () => {
+    const fetcher = routeFetch([
+      {
+        // 企业端点返回空 → 触发回退，从而两个端点都会被请求到
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [], models: [] } }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: ['glm-5.3'] }] } }), { status: 200 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3'])
+    const calls = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls
+    expect(calls[0]![0]).toContain('/console/enterprises/personal/models')
+    expect(calls.at(-1)![0]).toContain('/v3/config')
+    for (const [url, init] of calls) {
+      const headers = init.headers as Record<string, string>
+      expect(headers['X-Product-Code'], `URL=${url}`).toBe('workbuddy')
+      expect(headers['User-Agent']).toBe(WORKBUDDY.userAgent)
+      expect(headers['X-Product']).toBe('SaaS')
+    }
+  })
+
+  it('优先使用企业模型端点并解析其 cli agent', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/console/enterprises/personal/models'),
+      respond: () => new Response(JSON.stringify({
+        data: {
+          agents: [{ name: 'cli', models: ['gpt-5.6-sol', 'glm-5.2'] }],
+          models: [
+            { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', maxInputTokens: 1000000 },
+            { id: 'glm-5.2', name: 'GLM-5.2', maxInputTokens: 1000000 },
+          ],
+        },
+      }), { status: 200 }),
+    }])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    expect(models.map((m) => m.id)).toEqual(['gpt-5.6-sol', 'glm-5.2'])
+    // 命中企业端点后不应再请求 /v3/config
+    const urls = (fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls.map((c) => c[0])
+    expect(urls.some((u) => u.includes('/v3/config'))).toBe(false)
+  })
+
+  it('企业模型端点返回非 200 时回退到 /v3/config', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response('<html>500</html>', { status: 500 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: ['glm-5.3'] }] } }), { status: 200 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3'])
+  })
+
+  it('企业模型端点返回空列表时回退到 /v3/config', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [], models: [] } }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: ['glm-5.3'] }] } }), { status: 200 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3'])
+  })
+
+  it('两个端点都失败时返回空列表（交由调用方回退静态目录）', async () => {
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response('boom', { status: 500 }),
+    }])
+    expect(await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)).toEqual([])
+  })
+
+  it('企业模型端点用不带尾斜杠的路径（带斜杠会 403）', async () => {
+    const seen: string[] = []
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({ error: 'access_denied' }), { status: 403 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: ['glm-5.3'] }] } }), { status: 200 }),
+      },
+    ])
+    // 记录实际请求 URL（routeFetch 的 respond 不接收参数，故从 mock.calls 取）
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    seen.push(...(fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls.map((c) => c[0]))
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3'])
+    const scopedUrl = seen.find((u) => u.includes('/console/enterprises/personal/models'))
+    expect(scopedUrl).toBeDefined()
+    expect(scopedUrl!.endsWith('/models')).toBe(true)
   })
 })
 
@@ -254,5 +467,171 @@ describe('buddy runBuddyLoginFlow', () => {
       openBrowser: (url) => { opened.push(url) },
     })).rejects.toThrow('auth/state HTTP 500')
     expect(opened).toEqual([])
+  })
+})
+
+describe('产品参数化', () => {
+  it('fetchAuthState 默认使用 CodeBuddy 的 platform=ide', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/auth/state'),
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=ide&state=S' },
+      }), { status: 200 }),
+    }])
+    await fetchAuthState(fetcher)
+    const [url] = (fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls[0]
+    expect(url).toContain('platform=ide')
+  })
+
+  it('fetchAuthState 传入 WorkBuddy 配置时使用 platform=workbuddy', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/auth/state'),
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=workbuddy&state=S' },
+      }), { status: 200 }),
+    }])
+    await fetchAuthState(fetcher, undefined, WORKBUDDY)
+    const [url] = (fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls[0]
+    expect(url).toContain('platform=workbuddy')
+  })
+
+  it('runBuddyLoginFlow 在 CodeBuddy 下不追加 version/loginSessionId', async () => {
+    let openedUrl = ''
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/auth/state'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=ide&state=S' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/auth/token'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/login/account'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u', nickname: 'n', type: 'personal' } }), { status: 200 }),
+      },
+    ])
+    await runBuddyLoginFlow({
+      fetcher, pollIntervalMs: 0, product: CODEBUDDY,
+      openBrowser: (url) => { openedUrl = url },
+    })
+    expect(openedUrl).not.toContain('loginSessionId')
+    expect(openedUrl).not.toContain('version=')
+  })
+
+  it('runBuddyLoginFlow 在 WorkBuddy 下追加 version 与 loginSessionId', async () => {
+    let openedUrl = ''
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/auth/state'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=workbuddy&state=S' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/auth/token'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/login/account'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u', nickname: 'n', type: 'personal' } }), { status: 200 }),
+      },
+    ])
+    await runBuddyLoginFlow({
+      fetcher, pollIntervalMs: 0, product: WORKBUDDY,
+      openBrowser: (url) => { openedUrl = url },
+    })
+    expect(openedUrl).toContain(`version=${WORKBUDDY.pluginVersion as string}`)
+    expect(openedUrl).toMatch(/loginSessionId=[0-9a-f-]{36}/)
+    // 服务端下发的 platform 与 state 必须保留
+    expect(openedUrl).toContain('platform=workbuddy')
+    expect(openedUrl).toContain('state=S')
+  })
+
+  it('WorkBuddy 的 loginSessionId 每次登录都不同', async () => {
+    const mk = () => routeFetch([
+      {
+        when: (url) => url.includes('/auth/state'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?platform=workbuddy&state=S' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/auth/token'),
+        respond: () => new Response(JSON.stringify({
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/login/account'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u', nickname: 'n', type: 'personal' } }), { status: 200 }),
+      },
+    ])
+    const urls: string[] = []
+    for (let i = 0; i < 2; i++) {
+      await runBuddyLoginFlow({
+        fetcher: mk(), pollIntervalMs: 0, product: WORKBUDDY,
+        openBrowser: (url) => { urls.push(url) },
+      })
+    }
+    const id1 = new URL(urls[0]).searchParams.get('loginSessionId')
+    const id2 = new URL(urls[1]).searchParams.get('loginSessionId')
+    expect(id1).not.toBe(id2)
+  })
+})
+
+describe('decorateLoginUrl', () => {
+  it('只追加参数，不重建 URL（保留服务端独有参数）', () => {
+    // serverOnly 不在任何 product 配置里：只有「在服务端 authUrl 上追加」的实现
+    // 才能保留它；若实现改为「按 product 配置重建 URL」，platform/state 会被
+    // 硬编码值覆盖（或整体丢失），认证随即失败。
+    const authUrl = 'https://copilot.tencent.com/login?platform=workbuddy&state=S&serverOnly=keep-me'
+    const result = decorateLoginUrl(authUrl, WORKBUDDY)
+    const url = new URL(result)
+    expect(url.searchParams.get('serverOnly')).toBe('keep-me')
+    expect(url.searchParams.get('platform')).toBe('workbuddy')
+    expect(url.searchParams.get('state')).toBe('S')
+    expect(url.searchParams.get('version')).toBe(WORKBUDDY.pluginVersion)
+    expect(url.searchParams.get('loginSessionId')).toBeTruthy()
+    // 路径与 origin 也必须原样保留
+    expect(url.origin).toBe('https://copilot.tencent.com')
+    expect(url.pathname).toBe('/login')
+  })
+
+  it('appendSessionParams 为 false 时原样返回同一个字符串', () => {
+    const authUrl = 'https://copilot.tencent.com/login?platform=ide&state=S'
+    expect(decorateLoginUrl(authUrl, CODEBUDDY)).toBe(authUrl)
+  })
+
+  it('URL 非法时原样返回', () => {
+    expect(decorateLoginUrl('not a url', WORKBUDDY)).toBe('not a url')
+    expect(decorateLoginUrl('', WORKBUDDY)).toBe('')
+  })
+
+  it('pluginVersion 缺失时不追加 version 参数', () => {
+    const noVersion: BuddyProduct = { ...WORKBUDDY, pluginVersion: undefined }
+    const url = new URL(decorateLoginUrl('https://copilot.tencent.com/login?state=S', noVersion))
+    expect(url.searchParams.has('version')).toBe(false)
+    expect(url.searchParams.has('loginSessionId')).toBe(true)
+  })
+
+  it('fetchAuthState 使用 product.userAgent 作为请求头', async () => {
+    // 两个内置产品的 userAgent 字面量相同，无法观测该行为；注入自定义 UA 以锁定它。
+    const custom: BuddyProduct = { ...CODEBUDDY, userAgent: 'CustomAgent/9.9.9' }
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/auth/state'),
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { state: 'S', authUrl: 'https://copilot.tencent.com/login?state=S' },
+      }), { status: 200 }),
+    }])
+    await fetchAuthState(fetcher, undefined, custom)
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['User-Agent']).toBe('CustomAgent/9.9.9')
   })
 })

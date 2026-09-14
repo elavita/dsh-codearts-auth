@@ -20,6 +20,7 @@
 | `v4-large-write.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | deepseek-v4-flash 大文件写入（同上，免费额度） |
 | `login.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | 只走 CodeArts 浏览器登录与凭据换取 |
 | `buddy-login-probe.e2e.spec.ts` | `DSH_BUDDY_PROBE=1` | 只打印登录流程原始响应，不发模型请求 |
+| `workbuddy-claim-probe.e2e.spec.ts` | `DSH_WORKBUDDY_CLAIM_E2E=1` + `DSH_WORKBUDDY_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（不改模型额度，但会改动账号当日签到状态） |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -44,6 +45,9 @@ pnpm test:e2e:buddy-ratelimit
 
 # ⚠️ 会消耗 CodeArts 积分
 pnpm test:e2e:codearts
+
+# ⚠️ 会真实领取积分（改动当日签到状态）
+pnpm test:e2e:workbuddy-claim
 ```
 
 ## 限流真实性判定

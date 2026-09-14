@@ -22,8 +22,14 @@ import {
 import { RefreshScheduler } from './refresh.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { AccountPool } from './account-pool.js'
+import { CODEBUDDY, type BuddyProduct } from './product.js'
 
-/** Buddy 登录结果存储所用的凭据引用。 */
+/**
+ * CodeBuddy 的登录结果存储所用的凭据引用。
+ *
+ * 等价于 `CODEBUDDY.defaultCredentialRef`，保留此导出仅为兼容既有导入方；
+ * 新代码请改用 `BuddyAuth` 实例的 `credentialRefName` 字段（随产品变化）。
+ */
 export const BUDDY_CREDENTIAL_REF = 'BUDDY_ACCESS_TOKEN'
 
 /** 一次成功登录的结果。 */
@@ -54,6 +60,14 @@ export interface BuddyLoginStatus {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     buddyAuth: BuddyAuth
+    /**
+     * WorkBuddy 的认证服务实例。
+     *
+     * 与 `buddyAuth`（CodeBuddy）并列存在：cordis 的 `Service` 构造时按名称
+     * 注册，同名第二次注册会抛 `service "buddyAuth" has been registered`，
+     * 故两个产品必须各占一个服务名。
+     */
+    workbuddyAuth: BuddyAuth
   }
 }
 
@@ -71,6 +85,16 @@ function parseCredential(value: string): BuddyCredential | undefined {
 
 /** Buddy 登录服务：轮询式登录 + refresh_token 静默续期。 */
 export class BuddyAuth extends Service {
+  /** 本实例所属的产品配置（CodeBuddy 或 WorkBuddy）。 */
+  readonly product: BuddyProduct
+
+  /**
+   * 本实例默认读写的凭据 ref 名称。
+   * CodeBuddy 为 `BUDDY_ACCESS_TOKEN`，WorkBuddy 为 `WORKBUDDY_ACCESS_TOKEN`；
+   * 两个产品各自读写自己的 ref，凭据互不可见。
+   */
+  readonly credentialRefName: string
+
   private readonly scheduler = new RefreshScheduler(
     () => this.refresh(),
     (error) => {
@@ -88,8 +112,20 @@ export class BuddyAuth extends Service {
   /** 登录会话是否仍处于活跃状态；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
   private active = true
 
-  constructor(ctx: Context, private readonly options: { fetcher?: typeof fetch } = {}) {
-    super(ctx, 'buddyAuth')
+  constructor(
+    ctx: Context,
+    private readonly options: { fetcher?: typeof fetch; product?: BuddyProduct; serviceName?: string } = {},
+  ) {
+    // 默认 CodeBuddy，保证既有行为完全不变。
+    const product = options.product ?? CODEBUDDY
+    // 服务名必须随产品区分：cordis 的 Service 在构造时按名称注册，同名第二次
+    // 注册会抛 `service "buddyAuth" has been registered at <root>`，而
+    // CodeBuddy 与 WorkBuddy 需要同时存在两个实例。按产品 id 派生即可得到
+    // 稳定且互不冲突的两个名字：buddy → `buddyAuth`（与改造前完全一致）、
+    // workbuddy → `workbuddyAuth`；显式传入 serviceName 可覆盖。
+    super(ctx, options.serviceName ?? `${product.id}Auth`)
+    this.product = product
+    this.credentialRefName = this.product.defaultCredentialRef
   }
 
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。 */
@@ -101,10 +137,13 @@ export class BuddyAuth extends Service {
   /** 运行登录流程并持久化凭据。 */
   async login(flowOptions: { refName?: string; accountId?: string; pool?: AccountPool } & BuddyLoginFlowOptions = {}): Promise<BuddyLoginResult> {
     this.active = true
-    const ref = flowOptions.refName ? credentialRef(flowOptions.refName) : credentialRef(BUDDY_CREDENTIAL_REF)
+    const ref = flowOptions.refName ? credentialRef(flowOptions.refName) : credentialRef(this.credentialRefName)
     const flow = await runBuddyLoginFlow({
       ...this.options.fetcher !== undefined ? { fetcher: this.options.fetcher } : {},
       ...flowOptions,
+      // 产品配置决定 auth/state 的 platform 与登录 URL 附加参数：调用方显式传入优先，
+      // 否则用本实例的产品（WorkBuddy 实例不会退回 CodeBuddy）。
+      product: flowOptions.product ?? this.product,
     })
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
@@ -115,10 +154,10 @@ export class BuddyAuth extends Service {
     if (flowOptions.accountId && flowOptions.pool) {
       await flowOptions.pool.addAccount({
         id: flowOptions.accountId,
-        provider: 'buddy',
+        provider: this.product.id,
         nickname: flowOptions.accountId,
         enabled: true,
-        credentialRef: flowOptions.refName ?? BUDDY_CREDENTIAL_REF,
+        credentialRef: flowOptions.refName ?? this.credentialRefName,
         createdAt: Date.now(),
         expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
         refreshable: Boolean(credential) && isRefreshable(credential!),
@@ -156,7 +195,7 @@ export class BuddyAuth extends Service {
 
   /** 报告凭据是否已配置、过期时间、是否可刷新以及最近刷新错误。 */
   async status(): Promise<BuddyLoginStatus> {
-    const ref = credentialRef(BUDDY_CREDENTIAL_REF)
+    const ref = credentialRef(this.credentialRefName)
     const info = await this.ctx.credentials.describe(ref)
     if (!info.configured) return { configured: false, refreshable: false }
     let expiresAt: number | undefined
@@ -180,7 +219,7 @@ export class BuddyAuth extends Service {
 
   /** 静默续期：refresh_token 换取；无 refresh_token 时明确报错（由命令提示重新登录）。 */
   async refresh(): Promise<void> {
-    const ref = credentialRef(BUDDY_CREDENTIAL_REF)
+    const ref = credentialRef(this.credentialRefName)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('未配置凭据，请先登录')
     const credential = parseCredential(resolved.value)
@@ -189,7 +228,9 @@ export class BuddyAuth extends Service {
       throw new RefreshTokenExpiredError('无 refresh_token，请重新登录')
     }
     try {
-      const token = await refreshToken(credential, this.fetchImpl)
+      // 第 4 个参数是本实例的产品：WorkBuddy 续期时必须带自己的 UA，
+      // 否则会以 CodeBuddy 的身份标识请求刷新接口。
+      const token = await refreshToken(credential, this.fetchImpl, undefined, this.product)
       // 登出竞态保护：在途刷新期间已 logout()/stop() 时，跳过凭据回写与调度武装，
       // 避免已登出的凭据被在途刷新复活。
       if (!this.active) return
@@ -217,12 +258,12 @@ export class BuddyAuth extends Service {
   }
 
   /**
-   * 批量续期所有 buddy 账号。
-   * 遍历 pool 中 enabled + refreshable 的 buddy 账号，逐一续期。
+   * 批量续期本产品的所有账号。
+   * 遍历 pool 中 enabled + refreshable 的本产品账号，逐一续期。
    * 单账号失败不影响其他账号。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
-    const accounts = await pool.listAccounts('buddy')
+    const accounts = await pool.listAccounts(this.product.id)
     for (const entry of accounts) {
       if (!entry.enabled || !entry.refreshable) continue
       try {
@@ -237,7 +278,7 @@ export class BuddyAuth extends Service {
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
-        const token = await refreshToken(credential, this.fetchImpl)
+        const token = await refreshToken(credential, this.fetchImpl, undefined, this.product)
         const refreshed: BuddyCredential = {
           ...credential,
           access_token: token.accessToken,
@@ -272,7 +313,7 @@ export class BuddyAuth extends Service {
     // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
     this.active = false
     this.scheduler.stop()
-    await this.ctx.credentials.unset(credentialRef(BUDDY_CREDENTIAL_REF))
+    await this.ctx.credentials.unset(credentialRef(this.credentialRefName))
   }
 
   /** 停止刷新调度（不清理凭据）。 */
@@ -283,7 +324,7 @@ export class BuddyAuth extends Service {
 
   /** 启动时若已有可刷新凭据则安排续期（由 apply 调用）。 */
   scheduleRefresh(): void {
-    void this.ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF)).then((resolved) => {
+    void this.ctx.credentials.resolve(credentialRef(this.credentialRefName)).then((resolved) => {
       if (!resolved) return
       const credential = parseCredential(resolved.value)
       if (!credential || !isRefreshable(credential)) return
@@ -294,7 +335,7 @@ export class BuddyAuth extends Service {
 
   /** 从存储重载凭据，返回是否已过期（供 UI 判断是否需要提示重新登录）。 */
   async checkExpired(): Promise<boolean> {
-    const resolved = await this.ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
+    const resolved = await this.ctx.credentials.resolve(credentialRef(this.credentialRefName))
     if (!resolved) return true
     const credential = parseCredential(resolved.value)
     return credential === undefined ? true : isExpired(credential)
@@ -305,18 +346,23 @@ export class BuddyAuth extends Service {
    * 失败或未登录时返回空数组（调用方回退到内置列表）。
    *
    * 优先使用账号池中的可用账号；无账号池或池为空时回退到固定凭据 ref。
+   *
+   * **关键**：两处调用都必须把 `this.product` 传给 `fetchModels`，否则
+   * WorkBuddy 实例（Task 7 的 `fetchRemoteModels: () => workbuddy.fetchModels(pool)`）
+   * 会以 `X-Product-Code: codebuddy` + CodeBuddy 的 UA 请求 /v3/config，
+   * 即携带另一个产品的身份标识。
    */
   async fetchModels(pool?: AccountPool): Promise<BuddyRemoteModel[]> {
     // 优先账号池
     if (pool) {
-      const available = await pool.getAvailableAccount('buddy', '')
-      if (available) return fetchModels(available.credential as BuddyCredential, this.fetchImpl)
+      const available = await pool.getAvailableAccount(this.product.id, '')
+      if (available) return fetchModels(available.credential as BuddyCredential, this.fetchImpl, undefined, this.product)
     }
-    const resolved = await this.ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
+    const resolved = await this.ctx.credentials.resolve(credentialRef(this.credentialRefName))
     if (!resolved) return []
     const credential = parseCredential(resolved.value)
     if (!credential) return []
-    return fetchModels(credential, this.fetchImpl)
+    return fetchModels(credential, this.fetchImpl, undefined, this.product)
   }
 
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */

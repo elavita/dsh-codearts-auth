@@ -419,43 +419,139 @@ export interface BuddyRemoteModel {
 }
 
 /**
- * 从 /v3/config 响应解析模型列表（craft agent 的 models）。
+ * 从 /v3/config 响应解析可用的对话模型。
  *
- * 响应结构：{data: {agents: [{name: "craft", models: ["auto", "hy4-preview", ...]}, ...],
- *                     models: [{id, name, maxInputTokens, supportsImages, reasoning: {...}}]}}
- * craft agent 的 models 是字符串 id 列表；各模型的上下文窗口与能力从 data.models[]
- * 按 id 查找（权威来源，对齐 deveco-code-rust parse_models_from_config）。
- * 排除 "auto"（自动选择，非真实模型）。解析失败时返回空数组，调用方回退内置列表。
+ * 响应结构：{data: {agents: [{name: "craft", models: ["auto", ...]}, ...],
+ *                     models: [{id, name, maxInputTokens, supportsImages, reasoning: {...}}],
+ *                     productFeaturesConfig?: {ModelTrialBanner: {banners: [{targetModelId}]}}}}
+ *
+ * 解析策略（顺序即优先级）：
+ * 1. **craft agent 引用的模型** —— 主对话模型，排在最前（中国版由它列出
+ *    hy4-preview / glm-5.3 等具体 id）。
+ * 2. **data.models 中剩余的可对话模型** —— 国际版的 craft 只引用 5 个抽象别名
+ *    （default-model/fast-model/…），其余可用模型（如 o4-mini）只出现在
+ *    data.models 里；若只取 craft，这些模型会在选择器中消失。
+ * 3. **试用模型**（productFeaturesConfig.ModelTrialBanner）—— 例如国际版的
+ *    hy4-preview：它既不在 craft 列表也不在 data.models，仅由试用横幅下发，
+ *    但实测可正常调用，故一并加入。
+ *
+ * 过滤规则：跳过 `auto`（自动选择，非真实模型）、非对话用途的模型
+ * （`text-to-image` 标签）与补全/NES 等专用模型（id 前缀 nes- / completion-）。
+ * 解析失败时返回空数组，调用方回退内置列表。
  */
 export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   if (typeof body !== 'object' || body === null) return []
   const data = (body as Record<string, unknown>).data
   if (typeof data !== 'object' || data === null) return []
+  const record = data as Record<string, unknown>
+
   // data.models: id → 远端声明的模型元数据
   const metaById = new Map<string, Record<string, unknown>>()
-  if (Array.isArray((data as Record<string, unknown>).models)) {
-    for (const model of (data as Record<string, unknown>).models as unknown[]) {
+  if (Array.isArray(record.models)) {
+    for (const model of record.models as unknown[]) {
       if (typeof model !== 'object' || model === null) continue
-      const record = model as Record<string, unknown>
-      if (typeof record.id === 'string') metaById.set(record.id, record)
+      const entry = model as Record<string, unknown>
+      if (typeof entry.id === 'string') metaById.set(entry.id, entry)
     }
   }
-  const agents = (data as Record<string, unknown>).agents
-  if (!Array.isArray(agents)) return []
-  for (const agent of agents) {
-    if (typeof agent !== 'object' || agent === null) continue
-    const record = agent as Record<string, unknown>
-    if (record.name !== 'craft') continue
-    const models = record.models
-    if (!Array.isArray(models)) return []
-    const parsed: BuddyRemoteModel[] = []
-    for (const model of models) {
-      if (typeof model !== 'string' || model === 'auto') continue
-      parsed.push({ id: model, name: displayNameForModel(model), ...parseModelMeta(metaById.get(model)) })
-    }
-    return parsed
+
+  const parsed: BuddyRemoteModel[] = []
+  const seen = new Set<string>()
+  const push = (id: string): void => {
+    if (id === 'auto' || seen.has(id) || !isChatModel(id, metaById.get(id))) return
+    seen.add(id)
+    const meta = metaById.get(id)
+    // 显示名优先用服务端下发的 name（如 `GPT-5.6-Sol`、`GLM-5.3`）；
+    // 静态表只在服务端未给 name 时兜底 —— 新模型不在静态表里，
+    // 而静态表对老模型的叫法可能已过时（如 kimi-k2.6 旧名 Kimi K2.6）。
+    const remoteName = typeof meta?.name === 'string' && meta.name.length > 0 ? meta.name : undefined
+    parsed.push({ id, name: remoteName ?? displayNameForModel(id), ...parseModelMeta(meta) })
   }
-  return []
+
+  // 1. 主对话 agent 引用的模型优先。
+  //
+  // 两个端点用不同的 agent 名承载「输入框可选的模型」：
+  // - 企业模型端点（/console/enterprises/{scope}/models）用 `cli`；
+  // - /v3/config 用 `craft`。
+  // 取先出现的那个（两者不会同时存在）。
+  for (const agentName of PREFERRED_AGENT_NAMES) {
+    let found = false
+    const agents = record.agents
+    if (!Array.isArray(agents)) break
+    for (const agent of agents) {
+      if (typeof agent !== 'object' || agent === null) continue
+      const agentRecord = agent as Record<string, unknown>
+      if (agentRecord.name !== agentName) continue
+      if (Array.isArray(agentRecord.models)) {
+        for (const model of agentRecord.models) {
+          if (typeof model === 'string') push(model)
+        }
+      }
+      found = true
+      break
+    }
+    if (found) break
+  }
+
+  // 2. 补齐 data.models 里其余可对话模型（含企业端点独有的模型）
+  for (const id of metaById.keys()) push(id)
+
+  // 3. 追加试用模型（试用横幅下发的 targetModelId）
+  for (const id of trialModelIds(record)) {
+    if (id === 'auto' || seen.has(id)) continue
+    seen.add(id)
+    parsed.push({ id, name: displayNameForModel(id), ...parseModelMeta(metaById.get(id)) })
+  }
+
+  return parsed
+}
+
+/**
+ * 承载「可选对话模型」清单的 agent 名，按优先级排列。
+ *
+ * - `cli`：企业模型端点（/console/enterprises/{scope}/models）使用；
+ * - `craft`：/v3/config 使用。
+ */
+const PREFERRED_AGENT_NAMES = ['cli', 'craft'] as const
+
+/** 从 productFeaturesConfig.ModelTrialBanner 提取试用模型 id。 */
+function trialModelIds(data: Record<string, unknown>): string[] {
+  const features = data.productFeaturesConfig
+  if (typeof features !== 'object' || features === null) return []
+  const banner = (features as Record<string, unknown>).ModelTrialBanner
+  if (typeof banner !== 'object' || banner === null) return []
+  const banners = (banner as Record<string, unknown>).banners
+  if (!Array.isArray(banners)) return []
+  const ids: string[] = []
+  for (const item of banners) {
+    if (typeof item !== 'object' || item === null) continue
+    const target = (item as Record<string, unknown>).targetModelId
+    if (typeof target === 'string' && target.length > 0) ids.push(target)
+  }
+  return ids
+}
+
+/**
+ * 判断 data.models 中的条目是否为「可供用户选择的对话模型」。
+ *
+ * 排除三类非对话/不可用模型（判定依据来自真实的 /v3/config 响应与调用实测）：
+ * - 补全/NES 专用模型：id 以 `nes-` / `completion-` 开头，或带 `supportsExtra`
+ *   标记（codewise-completions / codewise-rewrite / codewise-jump），或
+ *   `codewise-` 前缀（codewise-default-model-v2 实测返回
+ *   `code 11102 model service info not found`，即后端未开放）；
+ * - 输出上限过小的模型（≤256 tokens 的都是补全用途，对话模型普遍 ≥24000）；
+ * - 带 `text-to-image` 标签的生成式模型（如 hunyuan-image-alpha）。
+ *
+ * 这些模型列进选择器会让用户选了之后报错，故一律过滤。
+ */
+function isChatModel(id: string, meta: Record<string, unknown> | undefined): boolean {
+  if (id.startsWith('nes-') || id.startsWith('completion-') || id.startsWith('codewise-')) return false
+  if (meta?.supportsExtra === true) return false
+  const maxOutput = meta?.maxOutputTokens
+  if (typeof maxOutput === 'number' && maxOutput > 0 && maxOutput <= 256) return false
+  const tags = meta?.tags
+  if (Array.isArray(tags) && tags.some((tag) => tag === 'text-to-image')) return false
+  return true
 }
 
 /**

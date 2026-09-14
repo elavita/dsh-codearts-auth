@@ -1,8 +1,9 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
-import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL } from '../../src/buddy-adapter.js'
+import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, registerBuddyLlm } from '../../src/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
+import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -45,6 +46,8 @@ function makeAdapter(overrides: {
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
+  product?: BuddyProduct
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -59,17 +62,22 @@ function makeAdapter(overrides: {
     fetchImpl,
     ...overrides.fetchRemoteModels !== undefined ? { fetchRemoteModels: overrides.fetchRemoteModels } : {},
     ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
+    ...overrides.product !== undefined ? { product: overrides.product } : {},
   })
 }
 
 describe('BuddyAdapter', () => {
   it('providerInfo identifies the buddy route', () => {
-    expect(makeAdapter().providerInfo('buddy')).toMatchObject({ id: 'buddy', name: 'CodeBuddy (Tencent)' })
+    // 展示名改由产品配置驱动（this.product.displayName）。CodeBuddy 的
+    // displayName 在 Task 1 定稿为 'CodeBuddy (腾讯)'（与 Jet Hub 前端
+    // PROVIDERS 的 label 一致），故不再断言旧字面量 'CodeBuddy (Tencent)'。
+    expect(makeAdapter().providerInfo('buddy')).toMatchObject({ id: 'buddy', name: CODEBUDDY.displayName })
   })
 
-  it('listModels falls back to the static catalog when no remote source is configured', async () => {
+  it('listModels falls back to the product catalog when no remote source is configured', async () => {
+    // CodeBuddy 现在自带 fallbackModels（实测可用的 14 个），故兜底不再是通用 DEFAULT_MODELS。
     const models = await makeAdapter().listModels('buddy')
-    expect(models.map((m) => m.id)).toContain('deepseek-v4-flash')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
     expect(models.map((m) => m.id)).toContain('glm-5.3')
     expect(models.every((m) => m.provider === 'buddy')).toBe(true)
   })
@@ -84,17 +92,19 @@ describe('BuddyAdapter', () => {
     })
     const first = await adapter.listModels('buddy')
     const second = await adapter.listModels('buddy')
-    expect(first.map((m) => m.id)).toEqual(['remote-model'])
-    expect(second.map((m) => m.id)).toEqual(['remote-model'])
+    // 产品兜底表是权威白名单：远端多出的 remote-model 被丢弃，
+    // 兜底表声明的模型被补齐。重复调用不应再触发远端拉取。
+    expect(first.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+    expect(second.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
     expect(calls).toBe(1, '远端列表只应拉取一次')
   })
 
-  it('listModels falls back to the static catalog when the remote fetch fails', async () => {
+  it('listModels falls back to the product catalog when the remote fetch fails', async () => {
     const adapter = makeAdapter({
       fetchRemoteModels: async () => { throw new Error('network down') },
     })
     const models = await adapter.listModels('buddy')
-    expect(models.map((m) => m.id)).toContain('deepseek-v4-flash')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
   })
 
   it('resolveModel reports the known context window', async () => {
@@ -143,7 +153,10 @@ describe('BuddyAdapter', () => {
   // "设置里需要声明才能用图片"。
   describe('图片能力声明', () => {
     it('远端 supportsImages=true 时声明 image 模态', async () => {
+      // 用无兜底表的产品：本节测「远端字段如何生效」，而兜底表会充当
+      // 白名单把这类临时 id 滤掉（另见「产品兜底模型目录校正」一节）。
       const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
         fetchRemoteModels: async () => [{ id: 'vision', name: 'V', supportsImages: true }],
       })
       expect((await adapter.resolveModel('buddy', 'vision')).inputModalities).toEqual(['text', 'image'])
@@ -151,6 +164,7 @@ describe('BuddyAdapter', () => {
 
     it('远端显式 supportsImages=false 时保持 text-only', async () => {
       const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
         fetchRemoteModels: async () => [{ id: 'plain', name: 'P', supportsImages: false }],
       })
       expect((await adapter.resolveModel('buddy', 'plain')).inputModalities).toEqual(['text'])
@@ -192,11 +206,22 @@ describe('BuddyAdapter', () => {
     })
 
     it('无可选等级的模型不暴露选择器', async () => {
-      // glm-5.1 远端只给固定 effort，没有 supportedEfforts。
+      // 远端与产品兜底表都未声明 reasoningEfforts 时不暴露选择器。
+      // （兜底表会给部分模型补上等级，故这里用无兜底表的产品测本行为）
       const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
         fetchRemoteModels: async () => [{ id: 'glm-5.1', name: 'GLM' }],
       })
       expect((await adapter.resolveModel('buddy', 'glm-5.1')).reasoning).toBeUndefined()
+    })
+
+    it('产品兜底表声明的等级在远端缺失时生效', async () => {
+      // glm-5.1 在 CodeBuddy 兜底表里声明了 medium 等级。
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'glm-5.1', name: 'GLM' }],
+      })
+      const resolved = await adapter.resolveModel('buddy', 'glm-5.1')
+      expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['medium'])
     })
   })
 
@@ -343,13 +368,17 @@ describe('BuddyAdapter credential handling', () => {
   })
 
   it('stream rejects images for a model that declares text-only', async () => {
+    // 用无兜底表的产品，使远端声明的 supportsImages=false 直接生效
+    // （兜底表会充当白名单）。模型 id 用兜底表之外的临时值。
+    const textOnly = 'text-only-probe'
     const adapter = makeAdapter({
+      product: { ...CODEBUDDY, fallbackModels: undefined } as never,
       readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
-      fetchRemoteModels: async () => [{ id: DEFAULT_MODEL, name: 'M', supportsImages: false }],
+      fetchRemoteModels: async () => [{ id: textOnly, name: 'M', supportsImages: false }],
       fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
     })
     const error = await collectChunks(adapter, {
-      model: DEFAULT_MODEL,
+      model: textOnly,
       messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
       signal: new AbortController().signal,
     } as never).catch((e: unknown) => e)
@@ -945,3 +974,374 @@ describe('BuddyAdapter 账号池限流切换', () => {
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */
 export { CHAT_API_BASE }
+
+describe('产品参数化', () => {
+  it('默认构造时 providerInfo 返回 buddy', () => {
+    expect(makeAdapter().providerInfo('buddy')).toMatchObject({
+      id: 'buddy', name: 'CodeBuddy (腾讯)',
+    })
+  })
+
+  it('传入 WorkBuddy 配置时 providerInfo 返回 workbuddy', () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+    })
+    const info = adapter.providerInfo('workbuddy')
+    // DSH 强制校验 info.id === 传入的 provider
+    expect(info.id).toBe('workbuddy')
+    expect(typeof info.name).toBe('string')
+    expect(info.name.length).toBeGreaterThan(0)
+  })
+
+  it('WorkBuddy 适配器的 listModels 使用 workbuddy 作为 provider 字段', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models.length).toBeGreaterThan(0)
+    expect(models.every((m) => m.provider === 'workbuddy')).toBe(true)
+  })
+
+  it('WorkBuddy 适配器请求带 X-Product-Code: workbuddy', async () => {
+    let productCode: string | null = null
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+      fetchImpl: async (_url, init) => {
+        productCode = (init?.headers as Headers).get('X-Product-Code')
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+    expect(productCode).toBe('workbuddy')
+  })
+
+  // ── 以下为补充用例：brief 的 4 条未能覆盖 UA、注册路由与默认回退 ──
+
+  it('默认构造的适配器使用 CodeBuddy 的产品码与 User-Agent', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+    expect(seen!.get('X-Product-Code')).toBe(CODEBUDDY.productCode)
+    expect(seen!.get('User-Agent')).toBe(CODEBUDDY.userAgent)
+    // 部署类型（X-Product）两个产品共用 SaaS，不随产品变化。
+    expect(seen!.get('X-Product')).toBe('SaaS')
+  })
+
+  it('WorkBuddy 适配器使用自身 product 的 productCode、User-Agent 与 providerInfo 展示名', async () => {
+    // 两个内置产品的 userAgent 字面量暂时相同，无法观测「是否取自 product」，
+    // 故这里注入自定义 UA 的 product，让该分支真正有鉴别力。
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
+    let seen: Headers | undefined
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: custom,
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+    expect(seen!.get('X-Product-Code')).toBe('workbuddy')
+    expect(seen!.get('User-Agent')).toBe('WorkBuddy/7.7.7')
+    expect(seen!.get('X-Product')).toBe('SaaS')
+    expect(adapter.providerInfo('workbuddy').name).toBe(WORKBUDDY.displayName)
+  })
+
+  it('send() 的 User-Agent 取自 product 而非固定常量', async () => {
+    // 反向验证：默认 CodeBuddy 的 UA 与注入值必须不同，否则该断言无意义。
+    const custom: BuddyProduct = { ...CODEBUDDY, userAgent: 'CustomAgent/9.9.9' }
+    expect(custom.userAgent).not.toBe(CODEBUDDY.userAgent)
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      product: custom,
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+    expect(seen!.get('User-Agent')).toBe('CustomAgent/9.9.9')
+  })
+
+  it('providerInfo 对非字符串入参回退到本产品的 id', () => {
+    // 上游传入 undefined 时不得让 deriveKeyRef 的 toUpperCase 崩在客户端。
+    const workbuddy = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+    })
+    expect(workbuddy.providerInfo(undefined as never).id).toBe('workbuddy')
+    expect(makeAdapter().providerInfo('' as never).id).toBe(CODEBUDDY.id)
+  })
+
+  /** 记录注册入参的假 llm 服务。 */
+  function makeLlm() {
+    const providers: Array<{ provider: string; displayName: string; settingsNs: string }> = []
+    const adapters: string[][] = []
+    const instances: unknown[] = []
+    return {
+      providers,
+      adapters,
+      instances,
+      llm: {
+        registerConfigurableProviders(entries: Array<{ provider: string; displayName: string; settingsNs: string }>) {
+          providers.push(...entries)
+          return { replace: () => {} }
+        },
+        registerAdapter(names: string[], adapter: unknown) {
+          adapters.push(names)
+          instances.push(adapter)
+          return { replace: () => {} }
+        },
+      },
+    }
+  }
+
+  it('registerBuddyLlm 默认注册 buddy 路由与 llm-buddy 命名空间', () => {
+    const fake = makeLlm()
+    registerBuddyLlm({ llm: fake.llm } as never, {
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+    })
+    expect(fake.providers).toEqual([
+      { provider: 'buddy', displayName: CODEBUDDY.displayName, settingsNs: 'llm-buddy', settingsPath: [] },
+    ])
+    expect(fake.adapters).toEqual([['buddy']])
+  })
+
+  it('registerBuddyLlm 传入 WorkBuddy 时注册 workbuddy 路由与 llm-workbuddy 命名空间', () => {
+    const fake = makeLlm()
+    registerBuddyLlm({ llm: fake.llm } as never, {
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+    })
+    // CodeBuddy 必须仍是 llm-buddy（与现状一致），WorkBuddy 得到 llm-workbuddy。
+    expect(fake.providers).toEqual([
+      { provider: 'workbuddy', displayName: WORKBUDDY.displayName, settingsNs: 'llm-workbuddy', settingsPath: [] },
+    ])
+    expect(fake.adapters).toEqual([['workbuddy']])
+  })
+
+  it('registerBuddyLlm 注册的适配器与其路由使用同一产品', async () => {
+    const fake = makeLlm()
+    registerBuddyLlm({ llm: fake.llm } as never, {
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+    })
+    // 注册进 llm 的适配器实例必须自己就是 WorkBuddy 产品（而非 CodeBuddy），
+    // 否则路由名为 workbuddy 却发 codebuddy 的身份标识。
+    const adapter = fake.instances[0] as BuddyAdapter
+    expect(adapter.providerInfo('workbuddy')).toMatchObject({ id: 'workbuddy', name: WORKBUDDY.displayName })
+    expect((await adapter.listModels('workbuddy')).every((m) => m.provider === 'workbuddy')).toBe(true)
+  })
+})
+
+/**
+ * 账号池 provider 实参。
+ *
+ * 适配器调用账号池时必须传「本适配器所属产品的 id」，而不是写死的 'buddy'。
+ * AccountPool 内部先按 `entry.provider !== provider` 过滤账号，WorkBuddy 账号的
+ * provider 是 'workbuddy'，传 'buddy' 会永远匹配不到：
+ *   - findAccountIdByCredential 恒返回 '' → 限流重置时间无法归属账号 → UI 永不显示限流标记；
+ *   - getAvailableAccount 恒返回 null → 限流后无法自动切换账号。
+ * 即 WorkBuddy 的账号池功能（限流归属 + 自动切换）会完全失效。
+ */
+describe('BuddyAdapter 向账号池传递的 provider', () => {
+  /** 6004 频率限制响应体（resetAt 取远未来，避免测试随时钟漂移）。 */
+  function rateLimitBody(): string {
+    return JSON.stringify({
+      code: 6004,
+      msg: '您的使用量已超出频率限制，将在 2099-12-31 23:59:59 UTC+8 重置',
+    })
+  }
+
+  /**
+   * 记录被查询 provider 的账号池替身。
+   * @returns queried - 按调用顺序记录 findAccountIdByCredential / getAvailableAccount 收到的 provider
+   */
+  function makeRecordingPool() {
+    const queried: string[] = []
+    return {
+      queried,
+      async listAccounts() {
+        return []
+      },
+      async findAccountIdByCredential(provider: string) {
+        queried.push(provider)
+        return 'acct-current'
+      },
+      async updateModelRateLimit() {},
+      async getAvailableAccount(provider: string) {
+        queried.push(provider)
+        return null
+      },
+    }
+  }
+
+  it('WorkBuddy 适配器以 workbuddy 作为 provider 查询账号池', async () => {
+    const pool = makeRecordingPool()
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: WORKBUDDY,
+      accountPool: pool as never,
+      fetchImpl: async () => new Response(rateLimitBody(), { status: 400 }),
+    })
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch(() => {})
+
+    // 两条路径都被走到；且都必须是 'workbuddy'，出现 'buddy' 即为回归。
+    expect(pool.queried.length).toBeGreaterThanOrEqual(2)
+    expect(pool.queried.filter((p) => p === 'workbuddy').length).toBeGreaterThanOrEqual(2)
+    expect(pool.queried.every((p) => p === 'workbuddy')).toBe(true)
+  })
+
+  it('CodeBuddy 适配器仍以 buddy 作为 provider 查询账号池', async () => {
+    const pool = makeRecordingPool()
+    // 不传 product：适配器回退到 CodeBuddy，provider 应为 'buddy'。
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async () => new Response(rateLimitBody(), { status: 400 }),
+    })
+    expect(adapter.providerInfo('buddy').id).toBe(CODEBUDDY.id)
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch(() => {})
+
+    // 对称性防守：修 WorkBuddy 时不得把 CodeBuddy 也改成 workbuddy。
+    expect(pool.queried.length).toBeGreaterThanOrEqual(2)
+    expect(pool.queried.every((p) => p === 'buddy')).toBe(true)
+  })
+})
+
+describe('产品兜底模型目录校正', () => {
+  /** 造一个只有 2 个模型的假产品，便于精确断言校正行为。 */
+  const fakeProduct = {
+    ...WORKBUDDY,
+    fallbackModels: [
+      { id: 'wanted-a', name: 'Wanted A', contextWindow: 111_000 },
+      { id: 'wanted-b', name: 'Wanted B', contextWindow: 222_000 },
+    ],
+  }
+
+  it('远端多出来的条目被丢弃（只保留兜底表声明的）', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: fakeProduct as never,
+      // 远端返回的是残缺/错误的集合（多出的 junk 与缺失的 wanted-b）
+      fetchRemoteModels: async () => [{ id: 'junk', name: 'Junk' }, { id: 'wanted-a', name: 'Wanted A' }],
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models.map((m) => m.id)).toEqual(['wanted-a', 'wanted-b'])
+  })
+
+  it('兜底表声明但远端缺失的条目被补进来', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: fakeProduct as never,
+      fetchRemoteModels: async () => [{ id: 'wanted-a', name: 'Wanted A' }],
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models.map((m) => m.id)).toEqual(['wanted-a', 'wanted-b'])
+    // 补齐的条目用兜底表的名称
+    expect(models[1]!.name).toBe('Wanted B')
+  })
+
+  it('远端元数据优先于兜底表（远端更权威）', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: fakeProduct as never,
+      fetchRemoteModels: async () => [
+        { id: 'wanted-a', name: 'Remote A', contextWindow: 999_000 },
+      ],
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models[0]!.name).toBe('Remote A')
+    const resolved = await adapter.resolveModel('workbuddy', 'wanted-a')
+    expect(resolved.name).toBe('Remote A')
+    expect(resolved.context?.contextWindow).toBe(999_000)
+  })
+
+  it('远端不可用时用兜底表的名称与上下文窗口', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: fakeProduct as never,
+      fetchRemoteModels: async () => [],
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models.map((m) => m.id)).toEqual(['wanted-a', 'wanted-b'])
+    const resolved = await adapter.resolveModel('workbuddy', 'wanted-b')
+    expect(resolved.name).toBe('Wanted B')
+    expect(resolved.context?.contextWindow).toBe(222_000)
+  })
+
+  it('没有兜底表的产品不受影响（保持既有远端行为）', async () => {
+    const noFallback = { ...WORKBUDDY, fallbackModels: undefined }
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: noFallback as never,
+      fetchRemoteModels: async () => [{ id: 'x', name: 'X' }, { id: 'y', name: 'Y' }],
+    })
+    const models = await adapter.listModels('workbuddy')
+    expect(models.map((m) => m.id)).toEqual(['x', 'y'])
+  })
+})

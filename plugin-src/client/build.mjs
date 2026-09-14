@@ -14,6 +14,10 @@ const result = await build({
   format: 'cjs',
   platform: 'browser',
   target: ['chrome100'],
+  // 默认 charset 为 'ascii'，会把所有中文转义成 \uXXXX：产物可读性差，
+  // 且使「用 includes 校验产物文案」的做法天然失效。改用 utf8 后产物保留原文，
+  // 加载器按 utf8 读取 bundle（dsh-client-modules 用 "utf8" 解码），故安全。
+  charset: 'utf8',
   external: ['react', 'react-dom'],
   write: false,
   minify: process.env.NODE_ENV === 'production',

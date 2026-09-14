@@ -6,6 +6,7 @@ import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
 import { runBuddyLoginFlow } from '../../src/buddy-oauth.js'
 import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
+import { WORKBUDDY } from '../../src/product.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
@@ -49,24 +50,63 @@ class FakeCommands {
 class FakeLlm {
   readonly providers: string[] = []
   readonly adapters: string[] = []
-  registerConfigurableProviders(entries: Array<{ provider: string }>): { replace: () => void } {
-    for (const entry of entries) this.providers.push(entry.provider)
+  /** `registerConfigurableProviders` 的入参明细，供目录项（displayName/settingsNs）断言使用。 */
+  readonly configurableProviders: Array<{ provider: string; displayName?: string; settingsNs?: string }> = []
+  /** `registerAdapter` 注册的路由名，供 provider 路由断言使用。 */
+  readonly registeredProviders: string[] = []
+  registerConfigurableProviders(
+    entries: Array<{ provider: string; displayName?: string; settingsNs?: string }>,
+  ): { replace: () => void } {
+    for (const entry of entries) {
+      this.providers.push(entry.provider)
+      this.configurableProviders.push(entry)
+    }
     return { replace: () => {} }
   }
   registerAdapter(providers: string[], _adapter: unknown): { replace: () => void } {
     this.adapters.push(...providers)
+    this.registeredProviders.push(...providers)
     return { replace: () => {} }
   }
 }
 
-function makeContext(): { ctx: Context; commands: FakeCommands; llm: FakeLlm } {
+/**
+ * settings 服务的替身。
+ *
+ * `registerProviderSettings` 会注册 provider 配置 namespace 并回读 `describe()`
+ * 自检，因此替身必须同时实现 `register` 与 `describe`，否则自检日志会走
+ * “describe 失败”分支，无法反映真实的 namespace 注册结果。
+ */
+class FakeSettings {
+  readonly registeredNamespaces: string[] = []
+  register(ns: string, _schema: unknown): void {
+    if (!this.registeredNamespaces.includes(ns)) this.registeredNamespaces.push(ns)
+  }
+  describe(): Array<{ ns: string }> {
+    return this.registeredNamespaces.map((ns) => ({ ns }))
+  }
+}
+
+function makeContext(): { ctx: Context; commands: FakeCommands; llm: FakeLlm; settings: FakeSettings } {
   const ctx = new Context()
   ctx.provide('credentials', new FakeCredentials() as never)
   const commands = new FakeCommands()
   ctx.provide('commands', commands as never)
   const llm = new FakeLlm()
   ctx.provide('llm', llm as never)
-  return { ctx, commands, llm }
+  const settings = new FakeSettings()
+  ctx.provide('settings', settings as never)
+  return { ctx, commands, llm, settings }
+}
+
+/**
+ * WorkBuddy 测试所用的 mock 上下文。
+ *
+ * 返回真实的 `Context`（`apply()` 需要它），替身通过 `ctx.provide` 注入，
+ * 测试里可直接以 `ctx.llm` / `ctx.settings` 取回并断言。
+ */
+function createMockContext(): Context & { llm: FakeLlm; commands: FakeCommands; settings: FakeSettings } {
+  return makeContext().ctx as Context & { llm: FakeLlm; commands: FakeCommands; settings: FakeSettings }
 }
 
 afterEach(() => {
@@ -144,75 +184,22 @@ describe('plugin entry', () => {
 })
 
 describe('buddy plugin entry', () => {
-  it('registers the buddyAuth service and the buddy login/status/refresh commands', () => {
+  it('registers the buddyAuth service without slash commands', () => {
+    // 登录/状态/续期都在 Jet Hub 设置页完成，命令式入口已移除。
     const { ctx, commands } = makeContext()
     apply(ctx)
     expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
     const names = commands.definitions.map((d) => d.name)
-    expect(names).toContain('buddy-login')
-    expect(names).toContain('buddy-status')
-    expect(names).toContain('buddy-refresh')
+    expect(names).not.toContain('buddy-login')
+    expect(names).not.toContain('buddy-status')
+    expect(names).not.toContain('buddy-refresh')
   })
 
   it('registers the buddy LLM route', () => {
-    const { ctx, commands, llm } = makeContext()
+    const { ctx, llm } = makeContext()
     apply(ctx)
     expect(llm.providers).toContain('buddy')
     expect(llm.adapters).toContain('buddy')
-    expect(commands.definitions.map((d) => d.name)).toContain('buddy-login')
-  })
-
-  it('buddy-login stores the credential and reports success', async () => {
-    mockedRunBuddyLoginFlow.mockResolvedValue({
-      access: '{"access_token":"AT","refresh_token":"RT","expires_at":"2026-08-30T00:00:00Z"}',
-      expires: Date.parse('2026-08-30T00:00:00Z'),
-      loginUrl: 'https://www.codebuddy.cn/login/?platform=ide&state=s',
-      refreshable: true,
-    })
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'buddy-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
-    expect((result as { text?: string }).text).toContain('BUDDY_ACCESS_TOKEN')
-    expect(await ctx.credentials.resolve('BUDDY_ACCESS_TOKEN')).toBeDefined()
-  })
-
-  it('buddy-login reports a failure as an error result', async () => {
-    mockedRunBuddyLoginFlow.mockRejectedValue(new Error('获取 token 超时（5 分钟）'))
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'buddy-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toEqual({ kind: 'error', text: '获取 token 超时（5 分钟）' })
-  })
-
-  it('buddy-status reports configured/refreshable state', async () => {
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
-      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
-    }))
-    const status = commands.definitions.find((d) => d.name === 'buddy-status')!
-    const result = await status.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
-    expect((result as { text: string }).text).toContain('已配置: true')
-    expect((result as { text: string }).text).toContain('可刷新: true')
   })
 
   it('stops the buddy refresh scheduler when the plugin context is disposed', async () => {
@@ -221,5 +208,105 @@ describe('buddy plugin entry', () => {
     const stopSpy = vi.spyOn(ctx.buddyAuth, 'stop')
     await ctx.fiber.dispose()
     expect(stopSpy).toHaveBeenCalled()
+  })
+})
+
+describe('WorkBuddy provider 注册', () => {
+  it('apply 时注册 buddy 与 workbuddy 两个 provider 路由', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const registered = ctx.llm.registeredProviders
+    expect(registered).toContain('buddy')
+    expect(registered).toContain('workbuddy')
+  })
+
+  it('WorkBuddy 使用独立的凭据 ref', () => {
+    expect(WORKBUDDY.defaultCredentialRef).toBe('WORKBUDDY_ACCESS_TOKEN')
+  })
+
+  it('注册 workbuddy 的可配置 provider 目录项', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const directory = ctx.llm.configurableProviders
+    const entry = directory.find((item: { provider: string }) => item.provider === 'workbuddy')
+    expect(entry).toMatchObject({ provider: 'workbuddy', displayName: WORKBUDDY.displayName })
+  })
+
+  // 关键前置：registerBuddyLlm 为 WorkBuddy 产生 settingsNs = llm-workbuddy。
+  // 该 namespace 未注册时，模型设置页会在 refFor → deriveKeyRef(provider)
+  // 处以 `provider.toUpperCase is not a function` 崩溃。
+  it('workbuddy 的 settingsNs 为 llm-workbuddy，且对应 settings namespace 已注册', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'workbuddy')
+    expect(entry?.settingsNs).toBe('llm-workbuddy')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy')
+  })
+
+  it('不注册任何 buddy/workbuddy 斜杠命令（入口在 Jet Hub 设置页）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status']) {
+      expect(names, removed).not.toContain(removed)
+    }
+    // codearts 的三个命令保留（CodeArts 没有 Jet Hub 登录入口的替代品）。
+    expect(names).toContain('codearts-login')
+    expect(names).toContain('codearts-status')
+    expect(names).toContain('codearts-refresh')
+    // 命令名必须唯一，重复注册会让后注册的覆盖先注册的。
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  // cordis 的 Service 构造时按名称注册，同名第二次注册会抛
+  // `service "buddyAuth" has been registered`。两个产品必须各占一个服务名，
+  // 否则 apply() 直接抛错、插件完全无法加载。
+  it('同时暴露 buddyAuth 与 workbuddyAuth 两个独立实例，各读自己的凭据 ref', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.workbuddyAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.buddyAuth).not.toBe(ctx.workbuddyAuth)
+    expect(ctx.buddyAuth.product.id).toBe('buddy')
+    expect(ctx.workbuddyAuth.product.id).toBe('workbuddy')
+    expect(ctx.buddyAuth.credentialRefName).toBe('BUDDY_ACCESS_TOKEN')
+    expect(ctx.workbuddyAuth.credentialRefName).toBe('WORKBUDDY_ACCESS_TOKEN')
+  })
+
+  it('workbuddyAuth 只读 WorkBuddy 自己的凭据 ref', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写入 CodeBuddy 的 ref：WorkBuddy 必须报告未配置。
+    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.workbuddyAuth.status()).configured).toBe(false)
+
+    // 写入 WorkBuddy 自己的 ref 后变为已配置。
+    await ctx.credentials.set('WORKBUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT2', refresh_token: 'RT2', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.workbuddyAuth.status()).configured).toBe(true)
+  })
+
+  it('buddyAuth 与 workbuddyAuth 的凭据互相隔离', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写 CodeBuddy 的 ref：CodeBuddy 已配置、WorkBuddy 未配置。
+    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.buddyAuth.status()).configured).toBe(true)
+    expect((await ctx.workbuddyAuth.status()).configured).toBe(false)
+  })
+
+  it('dispose 时同时停止 Buddy 与 WorkBuddy 的续期调度', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const buddyStop = vi.spyOn(ctx.buddyAuth, 'stop')
+    const workbuddyStop = vi.spyOn(ctx.workbuddyAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(buddyStop).toHaveBeenCalled()
+    expect(workbuddyStop).toHaveBeenCalled()
   })
 })

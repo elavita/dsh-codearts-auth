@@ -186,6 +186,61 @@ describe('buddy request headers', () => {
 })
 
 describe('buddy model config parsing', () => {
+  it('parses cli agent models from the enterprise models endpoint', () => {
+    // 企业模型端点（/console/enterprises/personal/models）用 `cli` agent
+    // 承载可选模型清单，且 data.models 带完整元数据（含 /v3/config 没有的 GPT 系列）。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [
+          { name: 'cli', models: ['default-model', 'gpt-5.6-sol', 'glm-5.2'] },
+          { name: 'general-purpose' },
+          { name: 'contentAnalyzer', models: ['lite'] },
+        ],
+        models: [
+          { id: 'default-model', name: 'Auto', maxInputTokens: 176000 },
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', maxInputTokens: 1000000 },
+          { id: 'glm-5.2', name: 'GLM-5.2', maxInputTokens: 1000000 },
+        ],
+      },
+    })
+    expect(models).toEqual([
+      { id: 'default-model', name: 'Auto', contextWindow: 176_000 },
+      { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000 },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000 },
+    ])
+  })
+
+  it('prefers the remote name over the static display table', () => {
+    // 服务端下发的 name 是权威来源：新模型不在静态表里，
+    // 且静态表对老模型的叫法可能已过时（如 kimi-k2.6 旧名 Kimi K2.6）。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'cli', models: ['gpt-5.6-sol', 'kimi-k2.6', 'unknown-model'] }],
+        models: [
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' },
+          { id: 'kimi-k2.6', name: 'Kimi-K2.6' },
+          { id: 'unknown-model' },
+        ],
+      },
+    })
+    expect(models.map((m) => m.name)).toEqual(['GPT-5.6-Sol', 'Kimi-K2.6', 'unknown-model'])
+  })
+
+  it('parses remote reasoning efforts from the enterprise endpoint', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'cli', models: ['gpt-5.6-terra'] }],
+        models: [{
+          id: 'gpt-5.6-terra',
+          name: 'GPT-5.6-Terra',
+          reasoning: { supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'high' },
+        }],
+      },
+    })
+    expect(models[0]!.reasoningEfforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(models[0]!.defaultReasoningEffort).toBe('high')
+  })
+
   it('parses craft agent models and excludes auto', () => {
     const models = parseModelsFromConfig({
       data: {
@@ -204,12 +259,14 @@ describe('buddy model config parsing', () => {
   it('attaches maxInputTokens from data.models as contextWindow', () => {
     // /v3/config data.models[].maxInputTokens 是模型上下文窗口的权威来源
     // （对齐 deveco-code-rust parse_models_from_config）。
+    // data.models 中未被 craft 引用但可对话的条目也会被补进列表（如 unknown-model）。
     const models = parseModelsFromConfig({
       data: {
-        agents: [{ name: 'craft', models: ['auto', 'glm-5.3-flash', 'kimi-k2.6', 'unknown-model'] }],
+        agents: [{ name: 'craft', models: ['auto', 'glm-5.3-flash', 'kimi-k2.6'] }],
         models: [
           { id: 'glm-5.3-flash', maxInputTokens: 1048576 },
           { id: 'kimi-k2.6', maxInputTokens: 262144 },
+          { id: 'unknown-model', maxInputTokens: 8192 },
           { id: 'bad-entry', maxInputTokens: 0 },
         ],
       },
@@ -217,8 +274,73 @@ describe('buddy model config parsing', () => {
     expect(models).toEqual([
       { id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 },
       { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144 },
-      { id: 'unknown-model', name: 'unknown-model' },
+      { id: 'unknown-model', name: 'unknown-model', contextWindow: 8192 },
+      { id: 'bad-entry', name: 'bad-entry' },
     ])
+  })
+
+  it('appends models from data.models that craft does not reference', () => {
+    // 国际版的 craft 只引用 5 个抽象别名，其余可用模型只出现在 data.models 里；
+    // 若只取 craft，这些模型会在选择器中消失。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['default-model'] }],
+        models: [
+          { id: 'default-model' },
+          { id: 'o4-mini', maxInputTokens: 128000 },
+          { id: 'hunyuan-image-alpha', tags: ['text-to-image'] },
+          { id: 'nes-1.2' },
+          { id: 'completion-1.0' },
+          { id: 'codewise-jump', maxOutputTokens: 256 },
+          { id: 'codewise-completions', supportsExtra: true },
+          { id: 'codewise-default-model-v2', maxOutputTokens: 32000 },
+          { id: 'compact-helper', maxOutputTokens: 256 },
+        ],
+      },
+    })
+    expect(models.map((m) => m.id)).toEqual(['default-model', 'o4-mini'])
+  })
+
+  it('appends trial models from productFeaturesConfig.ModelTrialBanner', () => {
+    // 国际版的 hy4-preview 既不在 craft 列表也不在 data.models，
+    // 仅由试用横幅下发，但实测可正常调用，故一并加入。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['default-model'] }],
+        models: [{ id: 'default-model' }],
+        productFeaturesConfig: {
+          ModelTrialBanner: {
+            banners: [{ modelId: 'hy4-preview-f', targetModelId: 'hy4-preview', trialDays: 14 }],
+          },
+        },
+      },
+    })
+    expect(models.map((m) => m.id)).toEqual(['default-model', 'hy4-preview'])
+    expect(models[1]!.name).toBe('Hy4 Preview')
+  })
+
+  it('does not duplicate a trial model already present', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['hy4-preview'] }],
+        models: [{ id: 'hy4-preview' }],
+        productFeaturesConfig: {
+          ModelTrialBanner: { banners: [{ targetModelId: 'hy4-preview' }] },
+        },
+      },
+    })
+    expect(models.map((m) => m.id)).toEqual(['hy4-preview'])
+  })
+
+  it('keeps craft models first when data.models has extra entries', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['glm-5.3', 'hy4-preview'] }],
+        models: [{ id: 'aaa-extra' }, { id: 'glm-5.3' }, { id: 'hy4-preview' }],
+      },
+    })
+    // craft 的顺序必须保留在最前，data.models 的其余条目追加在后
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3', 'hy4-preview', 'aaa-extra'])
   })
 
   it('parses the capability fields the adapter declares models from', () => {

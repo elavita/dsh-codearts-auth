@@ -336,3 +336,199 @@ describe('AccountPool', () => {
     expect(limits).toEqual([t1, t2, t3])
   })
 })
+
+describe('findAccountIdByCredential 的 provider 字段选择', () => {
+  it('workbuddy 按 access_token 匹配', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_T1'), JSON.stringify({
+      access_token: 'WB-TOKEN', refresh_token: 'RT', expires_at: String(Date.now() + 3_600_000),
+    }))
+    await pool.addAccount({
+      id: 'workbuddy-1', provider: 'workbuddy', nickname: 'WB', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_T1', createdAt: Date.now(), refreshable: true,
+    })
+    expect(await pool.findAccountIdByCredential('workbuddy', 'WB-TOKEN')).toBe('workbuddy-1')
+  })
+
+  it('workbuddy 不会误用 access_key_id 匹配', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_T2'), JSON.stringify({
+      access_token: 'WB-TOKEN', access_key_id: 'SOMETHING-ELSE', refresh_token: 'RT',
+      expires_at: String(Date.now() + 3_600_000),
+    }))
+    await pool.addAccount({
+      id: 'workbuddy-2', provider: 'workbuddy', nickname: 'WB', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_T2', createdAt: Date.now(), refreshable: true,
+    })
+    // 传入 access_token 值应命中
+    expect(await pool.findAccountIdByCredential('workbuddy', 'WB-TOKEN')).toBe('workbuddy-2')
+    // 传入 access_key_id 值不应命中（说明用的确实是 access_token 字段）
+    expect(await pool.findAccountIdByCredential('workbuddy', 'SOMETHING-ELSE')).toBe('')
+  })
+
+  it('codearts 仍按 access_key_id 匹配（既有行为不回归）', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('CODEARTS_ACCOUNT_T3'), JSON.stringify({
+      access_key_id: 'AK-1', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-12-31T00:00:00Z',
+    }))
+    await pool.addAccount({
+      id: 'codearts-1', provider: 'codearts', nickname: 'CA', enabled: true,
+      credentialRef: 'CODEARTS_ACCOUNT_T3', createdAt: Date.now(), refreshable: true,
+    })
+    expect(await pool.findAccountIdByCredential('codearts', 'AK-1')).toBe('codearts-1')
+  })
+
+  it('buddy 仍按 access_token 匹配（既有行为不回归）', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T4'), JSON.stringify({
+      access_token: 'BD-TOKEN', refresh_token: 'RT', expires_at: String(Date.now() + 3_600_000),
+    }))
+    await pool.addAccount({
+      id: 'buddy-4', provider: 'buddy', nickname: 'BD', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_T4', createdAt: Date.now(), refreshable: true,
+    })
+    expect(await pool.findAccountIdByCredential('buddy', 'BD-TOKEN')).toBe('buddy-4')
+  })
+})
+
+describe('pruneAccountsWithForeignDomain', () => {
+  /** WorkBuddy 国际版的判定目标：域名是 www.workbuddy.ai */
+  const product = { id: 'workbuddy', apiDomain: 'www.workbuddy.ai' } as never
+
+  it('删除 domain 指向旧端点（中国版）的 WorkBuddy 账号', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_OLD'), JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT',
+      expires_at: String(Date.now() + 3_600_000),
+      domain: 'copilot.tencent.com',
+    }))
+    await pool.addAccount({
+      id: 'workbuddy-old', provider: 'workbuddy', nickname: '旧', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_OLD', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual(['workbuddy-old'])
+    expect(await pool.listAllAccounts()).toHaveLength(0)
+  })
+
+  it('保留 domain 与新端点一致的 WorkBuddy 账号', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_NEW'), JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT',
+      expires_at: String(Date.now() + 3_600_000),
+      domain: 'www.workbuddy.ai',
+    }))
+    await pool.addAccount({
+      id: 'workbuddy-new', provider: 'workbuddy', nickname: '新', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_NEW', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual([])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('不触碰其他 provider 的账号', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    // CodeBuddy 账号的 domain 也是 copilot.tencent.com，但不该被 WorkBuddy 的清理波及
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_KEEP'), JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT',
+      expires_at: String(Date.now() + 3_600_000),
+      domain: 'copilot.tencent.com',
+    }))
+    await pool.addAccount({
+      id: 'buddy-keep', provider: 'buddy', nickname: 'CB', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_KEEP', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual([])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('domain 为空的历史凭据保守保留（无法判定）', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_NODOMAIN'), JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT',
+      expires_at: String(Date.now() + 3_600_000),
+      domain: '',
+    }))
+    await pool.addAccount({
+      id: 'workbuddy-nodomain', provider: 'workbuddy', nickname: '?', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_NODOMAIN', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual([])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('凭据缺失时不删除（交给正常的「凭据未配置」报错路径）', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.addAccount({
+      id: 'workbuddy-nocred', provider: 'workbuddy', nickname: '无', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_MISSING', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual([])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('凭据 JSON 损坏时不删除且不抛异常', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await ctx.credentials.set(credentialRef('WORKBUDDY_ACCOUNT_BROKEN'), '{not json')
+    await pool.addAccount({
+      id: 'workbuddy-broken', provider: 'workbuddy', nickname: '坏', enabled: true,
+      credentialRef: 'WORKBUDDY_ACCOUNT_BROKEN', createdAt: Date.now(), refreshable: true,
+    })
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed).toEqual([])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('混合场景：只删失配的，保留其余', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    for (const [ref, domain] of [
+      ['WORKBUDDY_ACCOUNT_A', 'copilot.tencent.com'],
+      ['WORKBUDDY_ACCOUNT_B', 'www.workbuddy.ai'],
+      ['WORKBUDDY_ACCOUNT_C', 'copilot.tencent.com'],
+    ] as const) {
+      await ctx.credentials.set(credentialRef(ref), JSON.stringify({
+        access_token: 'AT', refresh_token: 'RT',
+        expires_at: String(Date.now() + 3_600_000), domain,
+      }))
+      await pool.addAccount({
+        id: ref.toLowerCase(), provider: 'workbuddy', nickname: ref, enabled: true,
+        credentialRef: ref, createdAt: Date.now(), refreshable: true,
+      })
+    }
+
+    const removed = await pool.pruneAccountsWithForeignDomain(product)
+
+    expect(removed.sort()).toEqual(['workbuddy_account_a', 'workbuddy_account_c'])
+    const left = await pool.listAllAccounts()
+    expect(left).toHaveLength(1)
+    expect(left[0]!.id).toBe('workbuddy_account_b')
+  })
+})

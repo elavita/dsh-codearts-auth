@@ -8,7 +8,9 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 此外插件内置另外两个 provider 路由：
 
-- **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)。
+- **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
+  另支持「一键领取积分」（每日签到）。
+- **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
 
 ## 安装
 
@@ -93,6 +95,10 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
+除 `codearts` 外，插件另注册两个独立的腾讯系路由：`buddy`（见
+[buddy provider](#buddy-provider)）与 `workbuddy`（见
+[WorkBuddy provider](#workbuddy-provider)）。三者互不覆盖，可同时使用。
+
 ## 凭证
 
 - Ref：`CODEARTS_ACCESS_TOKEN`（POSIX 标识符格式的凭证 ref）。
@@ -173,11 +179,12 @@ Tokens 福利）。
 5. 续期：`POST /v2/plugin/auth/token/refresh`，通过 `X-Refresh-Token` 头提交
    refresh_token。
 
-- 命令：`/buddy-login`、`/buddy-status`、`/buddy-refresh`。
+- **登录入口：Jet Hub 设置页的 CodeBuddy 面板**（支持多账号与账号池自动切换）。
+  已不再注册斜杠命令 —— 设置面板已覆盖登录、状态查看与续期，命令式入口冗余。
 - 编程式调用：`ctx.buddyAuth.login()` / `status()` / `refresh()` / `logout()` /
   `fetchModels()`。
-- 模型列表：登录后从 `GET /v3/config`（craft agent 的 `models`）动态拉取，
-  拉取失败时回退到内置静态列表（DeepSeek V4、Hy4、GLM、Kimi、MiniMax 等）。
+- 模型列表：以内置的产品目录为准（`src/product.ts` 的 `fallbackModels`），
+  远端 `GET /v3/config` 可用时优先采用其元数据。
 - 请求头：除 `Authorization: Bearer` 外，还需 `X-Domain`、`X-Product`、
   `X-Product-Code` 以及伪装为 `CodeBuddyIDE/1.106.1` 的 `User-Agent`。
 - 凭据 ref：`BUDDY_ACCESS_TOKEN`，值为含 `access_token` / `refresh_token` /
@@ -187,3 +194,96 @@ Tokens 福利）。
 > （`chatcmpl-tool-xxx`），后续参数分片只有 `index`。适配器按 index 缓存并沿用
 > 真实 id（缺失时回退 `call_{index}`），保证同一工具的所有分片 id 一致——否则
 > 跨轮次（每轮都从 `call_0` 重新编号）会把 `tool/result` 配对到错误的历史条目。
+
+## WorkBuddy provider（国际版）
+
+独立路由 `workbuddy`（腾讯 **WorkBuddy 国际版 / WorkBuddy AI**），与
+[buddy provider](#buddy-provider) **同源**：共用同一 CLI 内核与同一认证协议
+（cli-external-link 轮询式），Bearer `access_token` 鉴权。差异收敛在
+`src/product.ts` 的产品配置里：
+
+| 项 | CodeBuddy（中国） | WorkBuddy（国际版） |
+|---|---|---|
+| `endpoint` | `https://copilot.tencent.com` | **`https://www.workbuddy.ai`** |
+| `platform` | `ide` | **`workbuddy-ai`** |
+| 登录 URL 附加参数 | 无 | **`version` / `loginSessionId`** |
+| `pluginVersion` | — | `5.5.2` |
+
+**模型列表不能与中国版共用**：两者的路径与响应解析完全相同
+（`GET /v3/config` → `data.data.models` / `data.data.agents`），差异只来自
+`endpoint` —— 不同区域的后端返回不同模型池（中国版含 glm / hy / deepseek 系，
+国际版含 claude / gpt / gemini / kimi 系）。因此 `endpoint` 必须随产品切换，
+不能被当成全局常量。
+
+登录流程与 CodeBuddy 一致（`auth/state` → 浏览器授权 → 轮询 `auth/token` →
+轮询 `login/account`），仅身份标识与端点按上表区分。`X-Product-Code` 为
+`workbuddy`，`X-Domain` 随 `apiDomain` 切换为 `www.workbuddy.ai`。
+
+**没有每日签到积分**：国际版后端不提供签到接口（内核中只有
+`/v2/billing/meter/get-dosage-notify` 用量通知），因此 Jet Hub 的 WorkBuddy
+面板**不显示「一键领取积分」按钮**；积分领取在 CodeBuddy 面板完成。
+
+- **登录入口：Jet Hub 设置页的 WorkBuddy 面板**（支持多账号与账号池自动切换）。
+  同样不注册斜杠命令。
+- 编程式调用：`ctx.workbuddyAuth.login()` / `status()` / `refresh()` / `logout()` /
+  `fetchModels()`。
+- 凭据 ref：
+  - 单账号：`WORKBUDDY_ACCESS_TOKEN`，值为含 `access_token` / `refresh_token` /
+    `expires_at` 的 JSON 字符串（与 `BUDDY_ACCESS_TOKEN` 同构）。
+  - 多账号：`WORKBUDDY_ACCOUNT_<UUID_SHORT>`，由 Jet Hub 设置页「+ 新建账号」
+    登录时自动生成并登记到账号池；每条账号记录带 `provider: 'workbuddy'`，
+    与 CodeBuddy 的 `BUDDY_ACCOUNT_*` 相互隔离，不会串用凭据或限流标记。
+- **从中国版升级**：本插件早期版本把 `workbuddy` 指向中国版
+  （`copilot.tencent.com`）。启动时会自动清理凭据 `domain` 与当前
+  `apiDomain` 不符的旧账号（这类凭据在新端点必然失败），清理结果记入日志，
+  请在 Jet Hub 重新登录。
+- 续期：与 CodeBuddy 共用同一套机制，插件启动后每 30 分钟对可续期账号静默刷新
+  （`refresh_token` 经 `X-Refresh-Token` 头提交），无需重新打开浏览器。
+- 请求头、模型列表拉取与流式工具调用 id 处理均与 CodeBuddy 一致，详见上一节。
+
+### 与 Jet Hub 设置页的关系
+
+Jet Hub（设置页）的账号面板按 provider 分组展示，WorkBuddy 是其中一栏：
+
+- 面板提供账号列表、新建账号（浏览器登录入池）、启用/停用、删除，以及「重测 /
+  重测所有 / 重置 / 重置所有」限流标记操作，行为与 CodeBuddy 面板一致，但
+  只操作 `provider: 'workbuddy'` 的账号。
+- 账号卡片只展示 credentialRef、有效期（含「自动续期」标记）与限流状态，
+  **不显示任何签到信息**；面板标题栏「一键领取积分」的结果来自 RPC 端点
+  `credits.claimAll`（实现见 `src/jet-hub-rpc.ts`，签到客户端见 `src/credits.ts`）。
+- 后端另实现了 `credits.status`（查询某 provider 下全部启用账号的签到状态），
+  但**前端尚无消费者**：`plugin-src/client/jet-hub.js` 只调用 `credits.claimAll`，
+  `credits.status` 目前仅供外部脚本或直接 RPC 调用使用。
+- 对应 LLM provider 的设置命名空间为 `llm-workbuddy`。
+
+### 一键领取积分（每日签到）
+
+**仅 CodeBuddy 面板提供**该按钮。CodeArts 是华为云账号体系不参与；WorkBuddy
+国际版后端没有签到接口，故其面板也不显示（积分领取在 CodeBuddy 侧完成）。
+
+在 Jet Hub → CodeBuddy 面板标题栏点击「**一键领取积分**」，插件会对该面板下
+**全部账号**顺序执行每日签到领取：
+
+> **含已停用账号。** 停用只影响账号池的自动选择与限流切换，不改变账号本身
+> 是否已签到——用户点「一键领取」时期望所有账号都尝试一遍。
+
+1. 先查签到活动状态（`POST /v2/billing/meter/checkin-activity-status`）；
+2. 活动未开启或今日已签到则跳过领取请求，只报告状态；
+3. 否则调用领取端点（`POST /v2/billing/meter/daily-checkin`）领取当日积分。
+
+完成后按钮下方给出结果摘要（如「3 个账号领取成功（+300 积分），1 个今日已领取」）。
+领取按账号隔离：单个账号凭据缺失、损坏或请求失败不会中断整批，只计入失败数；
+摘要**只显示各类计数**（如「1 个失败」），不展示每个账号的失败原因——原因保留在
+`results[].outcome.message` 中，需要时请通过 RPC 响应或日志查看。
+
+几点实现约定：
+
+- 领取是**顺序执行**的，避免并发触发风控；账号较多时需要等待片刻。
+- 重复领取是幂等的：服务端返回 HTTP 400 + `code 10001`（「今天已签到，请明天
+  再来」），插件把它识别为 `already-claimed` 而非失败。
+- 状态查询用 `checkin-activity-status` 而非 `checkin-status`；后者返回占位数据
+  （`active:false`、`checkin_dates:null`），会让人误判为活动未开启。
+- 请求**不需要** `X-Device-Token`（图灵盾）——已实测验证。
+
+想单独验证领取闭环（会真实改动账号当日签到状态）可运行
+`pnpm test:e2e:workbuddy-claim`，说明见 `tests/e2e/README.md`。

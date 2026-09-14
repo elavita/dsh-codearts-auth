@@ -2,6 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
+import type { BuddyProduct } from './product.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -152,6 +153,43 @@ export class AccountPool {
     return this.readAccounts()
   }
 
+  /**
+   * 清理「凭据域名与当前产品配置不符」的账号。
+   *
+   * 用途：WorkBuddy provider 从中国版（copilot.tencent.com）改造为国际版
+   * （www.workbuddy.ai）后，旧账号存的仍是中国版凭据 —— 它们的
+   * `token.domain` 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
+   * 这类条目已无修复价值，直接删除，让用户在 Jet Hub 重新登录。
+   *
+   * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
+   * provider 名删），这样只清理真正失配的条目，不会误删已在新端点登录的账号。
+   *
+   * @returns 被删除的账号 id 列表（供调用方记日志）。
+   */
+  async pruneAccountsWithForeignDomain(product: BuddyProduct): Promise<string[]> {
+    const removed: string[] = []
+    for (const entry of this.readAccounts()) {
+      if (entry.provider !== product.id) continue
+      let domain = ''
+      try {
+        const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined) continue
+        const parsed = JSON.parse(resolved.value) as { domain?: unknown }
+        domain = typeof parsed.domain === 'string' ? parsed.domain : ''
+      } catch {
+        // 凭据缺失或损坏：留给「凭据未配置」的正常报错路径处理，这里不删
+        continue
+      }
+      // domain 为空表示历史凭据未记录域名，无法判定，保守保留。
+      if (domain.length === 0) continue
+      if (domain !== product.apiDomain) {
+        await this.removeAccount(entry.id)
+        removed.push(entry.id)
+      }
+    }
+    return removed
+  }
+
   /** 添加新账号（登录成功后调用） */
   async addAccount(entry: ProviderAccountEntry): Promise<void> {
     const accounts = [...this.readAccounts(), entry]
@@ -187,13 +225,15 @@ export class AccountPool {
    *
    * 适配器不持有 ctx，也不该直接访问本类的私有凭据存储，
    * 因此这里集中做「遍历已启用账号 → 解析凭据 → 比对标识字段」。
-   * @param provider - provider 名称（'buddy' | 'codearts'）。
-   * @param identity - 比对用的标识值：buddy 传 access_token，codearts 传 access_key_id。
+   * @param provider - provider 名称（'buddy' | 'workbuddy' | 'codearts'）。
+   * @param identity - 比对用的标识值：CodeBuddy 系传 access_token，CodeArts 传 access_key_id。
    * @returns 匹配到的账号 id；无匹配返回空串。
    */
   async findAccountIdByCredential(provider: string, identity: string): Promise<string> {
     if (identity.length === 0) return ''
-    const identifierKey = provider === 'buddy' ? 'access_token' : 'access_key_id'
+    // 凭据中的唯一标识字段：CodeBuddy 系（buddy / workbuddy）用 access_token，
+    // CodeArts 用 access_key_id。选错字段会导致匹配恒失败，限流记录无法归属账号。
+    const identifierKey = provider === 'codearts' ? 'access_key_id' : 'access_token'
     for (const entry of this.readAccounts()) {
       if (entry.provider !== provider || !entry.enabled) continue
       const resolved = await this.resolveCredentialByRef(entry.credentialRef)

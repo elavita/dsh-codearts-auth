@@ -20,19 +20,30 @@ import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
-  API_DOMAIN,
   BUDDY_DEPLOYMENT_TYPE,
-  BUDDY_PRODUCT_CODE,
-  BUDDY_USER_AGENT,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_PRODUCT,
   HTTP_HEADER_PRODUCT_CODE,
   credentialExpiresAtMs,
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
+import { CODEBUDDY, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
+/**
+ * CodeBuddy（中国版）的 chat completions 基址。
+ *
+ * 仅供既有导入方（如 e2e 探针）使用；适配器实例实际请求的基址是
+ * `` `${this.product.endpoint}/v2` `` —— 国际版 WorkBuddy 的域名不同
+ * （www.workbuddy.ai），故不能再用本常量拼接请求 URL。
+ */
 export const CHAT_API_BASE = 'https://copilot.tencent.com/v2'
+/**
+ * CodeBuddy 的 provider 路由名（历史常量，保留导出以兼容既有导入方）。
+ *
+ * 注意：适配器实例实际使用的路由名是 `product.id`（`this.product.id`），
+ * 本常量只表示 CodeBuddy 那一份取值，不再代表所有产品。
+ */
 export const PROVIDER = 'buddy'
 
 /** 静态默认模型（对齐 /v3/config 返回的 craft agent models；动态拉取失败时的兜底）。 */
@@ -154,6 +165,15 @@ export interface BuddyAdapterOptions {
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
+  /**
+   * 产品配置；默认为 CodeBuddy。
+   *
+   * 决定请求身份标识（X-Product-Code / User-Agent）、模型元数据的 provider
+   * 字段、providerInfo 的展示名，以及 registerBuddyLlm 注册的路由与
+   * settingsNs。两个内置产品（CodeBuddy / WorkBuddy）共用同一后端与协议，
+   * 差异全部由本配置承载。
+   */
+  product?: BuddyProduct
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -374,8 +394,10 @@ function collectImages(content: readonly unknown[], refs: Map<string, unknown>):
   }
 }
 
-/** buddy (腾讯 CodeBuddy) 模型适配器。使用 Bearer access_token 鉴权。 */
+/** buddy (腾讯 CodeBuddy 系) 模型适配器。使用 Bearer access_token 鉴权。 */
 export class BuddyAdapter extends LlmAdapter {
+  /** 本适配器所属的产品配置（默认 CodeBuddy）。 */
+  private readonly product: BuddyProduct
   private readonly fetchImpl: typeof fetch
   /**
    * 前缀缓存会话标识（prompt_cache_key）。同一会话内所有请求复用同一 key，
@@ -388,11 +410,27 @@ export class BuddyAdapter extends LlmAdapter {
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
   private remoteContextWindows: ReadonlyMap<string, number> = new Map()
+  /**
+   * 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。
+   * 远端缺失时补位；构造时一次性建立，只读。
+   */
+  private readonly productFallbackIndex: ReadonlyMap<string, BuddyFallbackModel>
+  /** 产品级兜底上下文窗口（构造时从 fallbackModels 提取）。 */
+  private readonly productFallbackContextWindows: ReadonlyMap<string, number>
 
   constructor(private readonly options: BuddyAdapterOptions) {
     super()
+    // 默认 CodeBuddy，保证既有行为完全不变。
+    this.product = options.product ?? CODEBUDDY
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
+    const fallback = this.product.fallbackModels ?? []
+    this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]))
+    this.productFallbackContextWindows = new Map(
+      fallback
+        .filter((model) => model.contextWindow !== undefined)
+        .map((model) => [model.id, model.contextWindow as number]),
+    )
   }
 
   /**
@@ -402,12 +440,15 @@ export class BuddyAdapter extends LlmAdapter {
    * 模型设置页还会用该 id 计算 `deriveKeyRef(provider)`（内部调用
    * `provider.toUpperCase()`）。因此这里对入参做防御性归一化：
    * 一旦 `provider` 不是字符串（例如上游传入了 undefined），
-   * 直接回退到本适配器声明时的 PROVIDER 常量，避免
+   * 直接回退到本适配器所属产品的 id，避免
    * `undefined.toUpperCase is not a function` 在客户端炸开。
+   *
+   * 展示名同样来自产品配置：CodeBuddy 为 'CodeBuddy (腾讯)'，
+   * WorkBuddy 为 'WorkBuddy'。
    */
   providerInfo(provider: string): LlmProviderInfo {
-    const id = typeof provider === 'string' && provider.length > 0 ? provider : PROVIDER
-    return { id, name: 'CodeBuddy (Tencent)' }
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id
+    return { id, name: this.product.displayName }
   }
 
   /**
@@ -424,13 +465,16 @@ export class BuddyAdapter extends LlmAdapter {
     try {
       const models = await this.options.fetchRemoteModels()
       if (models.length > 0) {
-        this.remoteModels = models
         // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
-        // 注入逻辑）：远端下发的上下文窗口优先于 CONTEXT_WINDOWS 静态 fallback 表；
+        // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
         // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+        const reconciled = this.reconcileWithFallback(models)
+        this.remoteModels = reconciled
+        this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
         this.remoteContextWindows = new Map(
-          models.filter((model) => model.contextWindow !== undefined).map((model) => [model.id, model.contextWindow as number]),
+          reconciled
+            .filter((model) => model.contextWindow !== undefined)
+            .map((model) => [model.id, model.contextWindow as number]),
         )
       }
     } catch {
@@ -438,37 +482,109 @@ export class BuddyAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 用产品兜底表校正远端结果。
+   *
+   * 为什么需要校正：服务端按**认证上下文**决定返回哪些模型，插件的 CLI
+   * token 拿到的集合可能是残缺甚至错的 —— 实测 WorkBuddy 国际版的 CLI token
+   * 只拿到 13 个内部别名（含实际不可用的 `o4-mini`），而 IDE 用的是 20 个
+   * （含全部 GPT 系列）。此时若直接采信远端，模型选择器会缺掉用户真正要用的模型。
+   *
+   * 有产品兜底表时以它为准：
+   * - 只保留兜底表里声明的 id（远端多出来的别名/内部模型被丢弃）；
+   * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）。
+   *
+   * 没有产品兜底表（如 CodeBuddy）时原样返回远端结果，保持既有行为。
+   */
+  private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
+    const fallback = this.product.fallbackModels
+    if (fallback === undefined || fallback.length === 0) return [...models]
+    const remoteById = new Map(models.map((model) => [model.id, model]))
+    return fallback.map((entry) => {
+      const remote = remoteById.get(entry.id)
+      // 远端元数据优先（更权威），缺失的字段用兜底表补齐
+      return {
+        id: entry.id,
+        name: remote?.name ?? entry.name,
+        ...entry.contextWindow !== undefined || remote?.contextWindow !== undefined
+          ? { contextWindow: remote?.contextWindow ?? entry.contextWindow }
+          : {},
+        ...entry.supportsImages !== undefined || remote?.supportsImages !== undefined
+          ? { supportsImages: remote?.supportsImages ?? entry.supportsImages }
+          : {},
+        ...entry.reasoningEfforts !== undefined || remote?.reasoningEfforts !== undefined
+          ? { reasoningEfforts: [...(remote?.reasoningEfforts ?? entry.reasoningEfforts ?? [])] }
+          : {},
+        ...entry.defaultReasoningEffort !== undefined || remote?.defaultReasoningEffort !== undefined
+          ? { defaultReasoningEffort: remote?.defaultReasoningEffort ?? entry.defaultReasoningEffort }
+          : {},
+      }
+    })
+  }
+
   /** 模型接受的输入模态：远端 supportsImages 优先，静态表兜底。 */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    const supportsImages = this.remoteMeta.get(model)?.supportsImages ?? IMAGE_MODELS.has(model)
+    const supportsImages = this.remoteMeta.get(model)?.supportsImages
+      ?? this.productFallbackMeta.get(model)?.supportsImages
+      ?? IMAGE_MODELS.has(model)
     return supportsImages ? ['text', 'image'] : ['text']
   }
 
-  /** 模型可选的思考等级：远端 supportedEfforts 优先，静态表兜底。 */
+  /** 模型可选的思考等级：远端 supportedEfforts 优先，产品兜底表次之，通用静态表最后。 */
   private effortsFor(model: string): readonly string[] {
-    return this.remoteMeta.get(model)?.reasoningEfforts ?? REASONING_EFFORTS.get(model) ?? []
+    return this.remoteMeta.get(model)?.reasoningEfforts
+      ?? this.productFallbackMeta.get(model)?.reasoningEfforts
+      ?? REASONING_EFFORTS.get(model)
+      ?? []
+  }
+
+  /**
+   * 产品级兜底模型目录（`product.fallbackModels`）。
+   *
+   * 用于远端不可用或远端未覆盖到该模型时。与 `remoteMeta` 分开存放，
+   * 使远端一旦可用就自动优先，而产品兜底只在缺失时补位。
+   */
+  private get productFallbackMeta(): ReadonlyMap<string, BuddyFallbackModel> {
+    return this.productFallbackIndex
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    const source = this.remoteModels ?? this.staticFallbackModels()
     return source.map((model) => ({
-      provider: PROVIDER,
+      provider: this.product.id,
       id: model.id,
       name: model.name,
       inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
 
+  /**
+   * 静态兜底模型目录：优先用产品自带的 `fallbackModels`，否则用通用默认表。
+   *
+   * 产品兜底表存在的原因：模型池由服务端按认证上下文下发，插件的 CLI
+   * token 未必能取到完整集合（实测 WorkBuddy 国际版经 CLI token 只能拿到
+   * 13 个别名，拿不到 GPT 系列）。产品兜底表提供该产品权威的完整清单。
+   */
+  private staticFallbackModels(): readonly { id: string; name: string }[] {
+    const productModels = this.product.fallbackModels
+    if (productModels !== undefined && productModels.length > 0) {
+      return productModels.map((model) => ({ id: model.id, name: model.name }))
+    }
+    return DEFAULT_MODELS.map((id) => ({ id, name: id }))
+  }
+
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureRemoteModels()
-    // 优先远端 maxInputTokens，其次静态 fallback 表（对齐 Rust
-    // context_limit_for_model 的两级查找）。
-    const contextWindow = this.remoteContextWindows.get(model) ?? CONTEXT_WINDOWS.get(model)
+    // 三级查找：远端 maxInputTokens → 产品兜底表 → 通用静态表
+    // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
+    const contextWindow = this.remoteContextWindows.get(model)
+      ?? this.productFallbackContextWindows.get(model)
+      ?? CONTEXT_WINDOWS.get(model)
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
-      name: model,
+      name: this.remoteMeta.get(model)?.name ?? this.productFallbackIndex.get(model)?.name ?? model,
       inputModalities: this.inputModalitiesFor(model),
     }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
@@ -478,6 +594,7 @@ export class BuddyAdapter extends LlmAdapter {
     const efforts = this.effortsFor(model)
     if (efforts.length > 0) {
       const remoteDefault = this.remoteMeta.get(model)?.defaultReasoningEffort
+        ?? this.productFallbackIndex.get(model)?.defaultReasoningEffort
       resolved.reasoning = {
         efforts: efforts.map((id) => ({
           id: ReasoningEffortId(id),
@@ -524,17 +641,21 @@ export class BuddyAdapter extends LlmAdapter {
     let currentAccountId = ''
     if (this.options.accountPool && credential) {
       try {
+        // provider 实参必须是本适配器所属产品的 id（buddy / workbuddy）：
+        // AccountPool 先按 entry.provider !== provider 过滤账号，写死 'buddy'
+        // 时 WorkBuddy 账号（provider='workbuddy'）永远匹配不到，限流时间
+        // 无法归属账号，UI 也永不显示限流标记。
         currentAccountId = await this.options.accountPool.findAccountIdByCredential(
-          'buddy',
+          this.product.id,
           credential.access_token,
         )
         if (currentAccountId === '') {
           // 账号池里没有匹配该凭据的账号（例如用的是回退的单凭据），
           // 此时限流无法归属到具体账号，也就无法在 UI 上显示标记。
-          console.warn('[buddy] 当前凭据未匹配到账号池条目，限流记录将被跳过')
+          console.warn(`[${this.product.id}] 当前凭据未匹配到账号池条目，限流记录将被跳过`)
         }
       } catch (error) {
-        console.warn('[buddy] 账号匹配失败（不影响本次请求）:', error)
+        console.warn(`[${this.product.id}] 账号匹配失败（不影响本次请求）:`, error)
       }
     }
 
@@ -631,8 +752,9 @@ export class BuddyAdapter extends LlmAdapter {
               currentAccountId, parsed.modelId, parsed.resetTimeMs,
             )
           }
-          // 取下一个未尝试过的可用账号
-          const next = await this.options.accountPool.getAvailableAccount('buddy', options.model)
+          // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
+          // 永远取不到候选账号，限流后无法自动切换）
+          const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model)
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
           credential = next.credential as BuddyCredential
@@ -667,13 +789,15 @@ export class BuddyAdapter extends LlmAdapter {
     headers.set('Authorization', `Bearer ${credential.access_token}`)
     headers.set('Accept', 'text/event-stream')
     headers.set('Content-Type', 'application/json')
-    headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? API_DOMAIN)
+    headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? this.product.apiDomain)
+    // X-Product 是**部署类型**（SaaS），各产品共用同一取值，
+    // 故保持常量；随产品变化的身份标识是 X-Product-Code 与 User-Agent。
     headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
-    headers.set(HTTP_HEADER_PRODUCT_CODE, BUDDY_PRODUCT_CODE)
-    // User-Agent 必须伪装为 CodeBuddy IDE（后端以此识别客户端）。
-    headers.set('User-Agent', BUDDY_USER_AGENT)
+    headers.set(HTTP_HEADER_PRODUCT_CODE, this.product.productCode)
+    // User-Agent 必须伪装为对应产品的 IDE 客户端（后端以此识别客户端）。
+    headers.set('User-Agent', this.product.userAgent)
     try {
-      return await this.fetchImpl(`${CHAT_API_BASE}/chat/completions`, {
+      return await this.fetchImpl(`${this.product.endpoint}/v2/chat/completions`, {
         method: 'POST',
         headers,
         body,
@@ -924,10 +1048,19 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
   return expiresAt === undefined ? false : Date.now() >= expiresAt
 }
 
-/** 在 ctx.llm 上注册 buddy 提供商路由和适配器。 */
+/**
+ * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
+ *
+ * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
+ * CodeBuddy 得到 `buddy` / `llm-buddy`（与改造前完全一致），
+ * WorkBuddy 得到 `workbuddy` / `llm-workbuddy`。
+ * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
+ * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
+ */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
+  const product = options.product ?? CODEBUDDY
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'CodeBuddy (Tencent)', settingsNs: 'llm-buddy', settingsPath: [] },
+    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([PROVIDER], new BuddyAdapter(options))
+  ctx.llm.registerAdapter([product.id], new BuddyAdapter(options))
 }

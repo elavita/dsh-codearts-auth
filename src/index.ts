@@ -8,6 +8,7 @@ import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
+import { CODEBUDDY, WORKBUDDY } from './product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 
 export const name = 'codearts-auth'
@@ -72,12 +73,52 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
   }
 }
 
+/**
+ * 图片附件桥接：把持久化图片读成原始字节供适配器内联。
+ *
+ * 用 `ctx.get` 而非 `inject` —— 附件服务缺失时 provider 仍可正常加载，
+ * 只是收到图片时报 UNSUPPORTED_CONTENT。两个 CodeBuddy 系产品（CodeBuddy /
+ * WorkBuddy）共用同一后端与协议，图片能力相同，故共用本实现。
+ */
+function makeReadImage(ctx: Context) {
+  return async (attachment: unknown): Promise<{ data: Uint8Array; mediaType: string } | undefined> => {
+    const attachments = ctx.get('attachments') as
+      { readImage?: (ref: never) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> } | undefined
+    if (attachments?.readImage === undefined) return undefined
+    try {
+      const stored = await attachments.readImage(attachment as never)
+      return { data: stored.data, mediaType: stored.ref.mediaType }
+    } catch {
+      return undefined
+    }
+  }
+}
+
 /** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
 export function apply(ctx: Context): void {
   // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  registerProviderSettings(ctx, 'llm-buddy', 'llm-codearts')
+  // 三个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
+  // WorkBuddy（workbuddy）路由 —— 后者由 registerBuddyLlm 以
+  // `llm-${product.id}` 派生，漏注册会让模型设置页在
+  // `refFor → deriveKeyRef(provider)` 处以 `provider.toUpperCase is not a function` 崩溃。
+  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts')
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
+
+  // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
+  // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
+  // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
+  // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
+  void pool.pruneAccountsWithForeignDomain(WORKBUDDY).then((removed) => {
+    if (removed.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已清理 ${removed.length} 个 WorkBuddy 旧版（中国版）账号，请重新登录：${removed.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 清理 WorkBuddy 旧版账号失败：${String(error)}`)
+  })
+
   ctx.commands.register({
     name: 'codearts-login',
     description: '通过浏览器 OAuth 登录华为云 CodeArts',
@@ -148,56 +189,9 @@ export function apply(ctx: Context): void {
   })
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
+  // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
+  // 命令式的单凭据入口已无必要。
   const buddy = new BuddyAuth(ctx)
-  ctx.commands.register({
-    name: 'buddy-login',
-    description: '通过浏览器登录腾讯 CodeBuddy',
-    handler: async (): Promise<CommandResult> => {
-      try {
-        const result = await buddy.login()
-        return {
-          kind: 'success',
-          text: `CodeBuddy 登录完成。凭据已存储于 ${String(result.ref)}；`
-            + `${result.expires > 0 ? `过期时间 ${new Date(result.expires).toISOString()}` : '过期时间未知'}。`,
-        }
-      } catch (error) {
-        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-      }
-    },
-  })
-  ctx.commands.register({
-    name: 'buddy-status',
-    description: '显示 CodeBuddy 登录状态及刷新能力',
-    handler: async (): Promise<CommandResult> => {
-      const status = await buddy.status()
-      return {
-        kind: 'success',
-        text: [
-          `已配置: ${status.configured}`,
-          ...status.source === undefined ? [] : [`来源: ${status.source}`],
-          ...status.expiresAt === undefined ? [] : [`过期时间: ${new Date(status.expiresAt).toISOString()}`],
-          `可刷新: ${status.refreshable}`,
-          ...status.refreshError === undefined ? [] : [`刷新错误: ${status.refreshError}`],
-        ].join('\n'),
-      }
-    },
-  })
-  ctx.commands.register({
-    name: 'buddy-refresh',
-    description: '静默刷新 CodeBuddy 凭据',
-    handler: async (): Promise<CommandResult> => {
-      try {
-        await buddy.refresh()
-        const status = await buddy.status()
-        return {
-          kind: 'success',
-          text: `CodeBuddy 凭据已刷新；过期时间 ${status.expiresAt === undefined ? '未知' : new Date(status.expiresAt).toISOString()}。`,
-        }
-      } catch (error) {
-        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-      }
-    },
-  })
   registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
     resolveCredential: async () => {
@@ -216,21 +210,37 @@ export function apply(ctx: Context): void {
     },
     refresh: () => buddy.refresh(),
     fetchRemoteModels: () => buddy.fetchModels(pool),
-    // 图片附件：桥接 ctx.attachments，把持久化图片读成原始字节供适配器内联。
-    // 用 ctx.get 而非 inject —— 附件服务缺失时 provider 仍可正常加载，
-    // 只是收到图片时报 UNSUPPORTED_CONTENT。
-    readImage: async (attachment) => {
-      const attachments = ctx.get('attachments') as
-        { readImage?: (ref: never) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> } | undefined
-      if (attachments?.readImage === undefined) return undefined
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: CODEBUDDY,
+  })
+
+  // ===== WorkBuddy (腾讯 WorkBuddy) 服务 =====
+  // 与 CodeBuddy 同源（同后端、同协议），差异全部由 product 配置承载。
+  // 服务名由 BuddyAuth 依 product.id 派生，故两个产品分别注册为
+  // ctx.buddyAuth / ctx.workbuddyAuth，互不覆盖。
+  // 同样不注册斜杠命令：入口在 Jet Hub 的 WorkBuddy 面板。
+  const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY })
+  registerBuddyLlm(ctx, {
+    credentialRef: credentialRef(WORKBUDDY.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 workbuddy 的账号池取账号，回退到 WorkBuddy 自己的单凭据 ref，
+      // 保证不会串用 CodeBuddy 的凭据。
+      const available = await pool.getAvailableAccount('workbuddy', '')
+      if (available) return available.credential as BuddyCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
+      if (!resolved) return undefined
       try {
-        const stored = await attachments.readImage(attachment as never)
-        return { data: stored.data, mediaType: stored.ref.mediaType }
+        return JSON.parse(resolved.value) as BuddyCredential
       } catch {
         return undefined
       }
     },
+    refresh: () => workbuddy.refresh(),
+    fetchRemoteModels: () => workbuddy.fetchModels(pool),
+    readImage: makeReadImage(ctx),
     accountPool: pool,
+    product: WORKBUDDY,
   })
 
   // ===== 多账号静默续期调度 =====
@@ -244,6 +254,9 @@ export function apply(ctx: Context): void {
     try {
       await buddy.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      await workbuddy.refreshAll(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期
@@ -256,6 +269,7 @@ export function apply(ctx: Context): void {
         clearInterval(refreshTimer)
         service.stop()
         buddy.stop()
+        workbuddy.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -264,9 +278,10 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     service.stop()
     buddy.stop()
+    workbuddy.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddy)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy)
   ctx.provide('accountPool', pool)
 }

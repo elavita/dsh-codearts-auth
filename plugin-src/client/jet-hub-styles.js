@@ -26,6 +26,7 @@ const STYLES = `
 .dim-jh-providerIcon img { display: block; width: 20px; height: 20px; border-radius: 2px; }
 .dim-jh-providerIcon.codearts { background: white; }
 .dim-jh-providerIcon.buddy { background: white; }
+.dim-jh-providerIcon.workbuddy { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }

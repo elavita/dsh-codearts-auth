@@ -6,17 +6,20 @@
  * 通道名 jet-hub → 路径 /api/jet-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.refresh / account.retest / account.retestAll /
- *           account.reset / account.resetAll / login.poll
+ *           account.reset / account.resetAll / login.poll /
+ *           credits.status / credits.claimAll
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
-import { fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
+import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
+import { claimDailyCheckin, fetchCheckinStatus, type CheckinStatus, type ClaimOutcome } from './credits.js'
+import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
 import {
   resetAccount,
   resetAllAccounts,
@@ -24,6 +27,7 @@ import {
   retestAllAccounts,
 } from './account-probe.js'
 import type {
+  ProviderAccountEntry,
   RpcListAccountsRequest,
   RpcListAccountsResponse,
   RpcCreateAccountRequest,
@@ -38,6 +42,11 @@ import type {
   RpcRetestAllRequest,
   RpcResetAccountRequest,
   RpcResetAllRequest,
+  RpcCreditsStatusRequest,
+  RpcCreditsStatusResponse,
+  RpcCreditsClaimAllRequest,
+  RpcCreditsClaimAllResponse,
+  RpcCreditsClaimSummary,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -65,6 +74,155 @@ function parseBuddyCredential(raw: string): BuddyCredential | undefined {
 }
 
 /**
+ * 汇总一次批量领取的结果。
+ * 纯函数，便于单测；inactive（无资格/活动结束）与 failed 分开计数，
+ * 因为前者是正常的业务状态、后者才是需要用户关注的问题。
+ */
+export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
+  const summary: RpcCreditsClaimSummary = {
+    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+  }
+  for (const outcome of outcomes) {
+    switch (outcome.kind) {
+      case 'claimed':
+        summary.claimed += 1
+        summary.totalCredit += outcome.credit
+        break
+      case 'already-claimed':
+        summary.alreadyClaimed += 1
+        break
+      case 'inactive':
+        summary.inactive += 1
+        break
+      case 'failed':
+        summary.failed += 1
+        break
+      default: {
+        // 编译期穷尽性检查：ClaimOutcome 未来新增 kind 时此处会报错，
+        // 迫使作者显式决定它该计入哪一栏，而不是被静默漏计。
+        const exhaustive: never = outcome
+        void exhaustive
+        // 运行期兜底：类型声明与运行时不符（未知 kind）时按 failed 计入，
+        // 宁可多报一个失败，也不让结果凭空消失。
+        summary.failed += 1
+        break
+      }
+    }
+  }
+  return summary
+}
+
+/**
+ * 积分端点的可注入依赖。
+ *
+ * 抽出这一层是为了让「逐账号处理」能脱离 `ctx.connection.fetch` 注册流程
+ * 单独单测：端点内不做任何业务判断，只负责取账号列表并转交下面的纯函数。
+ */
+export interface CreditsEndpointDeps {
+  /**
+   * 解析凭据引用。
+   * 按设计该接口**不可信**（凭据可能已被外部删除、provider 后端异常），
+   * 实现允许抛错，调用方必须把异常算在单个账号头上。
+   */
+  resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
+  /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
+  fetchStatus?: (credential: BuddyCredential, product: BuddyProduct) => Promise<CheckinStatus | null>
+  /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
+  claim?: (credential: BuddyCredential, product: BuddyProduct) => Promise<ClaimOutcome>
+  /** 单账号异常时的告警出口（不参与控制流）。 */
+  warn?: (message: string) => void
+}
+
+/**
+ * 逐账号收集签到状态（顺序执行，避免并发触发风控）。
+ *
+ * **包含已停用账号**：停用只影响账号池的自动选择与限流切换，不改变账号本身
+ * 是否已签到。用户要看到的是「这个账号今天领了没」，因此这里不过滤 enabled。
+ *
+ * 关键约束：**凭据解析也在 try 之内**。`credentialRef()` 会对名称做正则校验
+ * （非法名称抛 TypeError），`deps.resolve()` 也可能抛错。若把它们留在 try
+ * 之外，任一账号的异常都会冒泡到 handleMethod 外层 catch，使整批请求以
+ * `jet-hub/handler-failed` 失败——违背「单个账号失败不中断整体」的设计。
+ */
+export async function collectCreditsStatus(
+  accounts: readonly ProviderAccountEntry[],
+  product: BuddyProduct,
+  deps: CreditsEndpointDeps,
+): Promise<RpcCreditsStatusResponse['accounts']> {
+  const fetchStatus = deps.fetchStatus ?? fetchCheckinStatus
+  const results: RpcCreditsStatusResponse['accounts'] = []
+  // 顺序查询，避免并发触发风控
+  for (const entry of accounts) {
+    let status: CheckinStatus | null = null
+    try {
+      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      if (resolved !== undefined) {
+        const credential = JSON.parse(resolved.value) as BuddyCredential
+        status = await fetchStatus(credential, product)
+      }
+    } catch (error) {
+      // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
+      deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
+      status = null
+    }
+    results.push({ accountId: entry.id, nickname: entry.nickname, status })
+  }
+  return results
+}
+
+/**
+ * 逐账号执行一键领取（顺序执行，单个账号失败不中断整体）。
+ *
+ * **包含已停用账号**：签到领取与「是否参与账号池自动选择」无关 —— 停用的
+ * 账号同样有当日积分可领，用户点「一键领取」时期望所有账号都尝试一遍。
+ * 停用只影响限流切换时的候选集合，不影响这里。
+ *
+ * 与 collectCreditsStatus 同理：凭据解析位于每个账号自己的 try 之内，
+ * 异常只让该账号记为 failed。
+ */
+export async function collectClaimResults(
+  accounts: readonly ProviderAccountEntry[],
+  product: BuddyProduct,
+  deps: CreditsEndpointDeps,
+): Promise<RpcCreditsClaimAllResponse> {
+  const fetchStatus = deps.fetchStatus ?? fetchCheckinStatus
+  const claim = deps.claim ?? claimDailyCheckin
+  const results: RpcCreditsClaimAllResponse['results'] = []
+  const outcomes: ClaimOutcome[] = []
+  for (const entry of accounts) {
+    let outcome: ClaimOutcome
+    try {
+      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      if (resolved === undefined) {
+        outcome = { kind: 'failed', code: -1, message: '凭据未配置' }
+      } else {
+        const credential = JSON.parse(resolved.value) as BuddyCredential
+        // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
+        const status = await fetchStatus(credential, product)
+        if (status !== null && !status.active) {
+          outcome = { kind: 'inactive', message: '签到活动未开启' }
+        } else if (status !== null && status.todayCheckedIn) {
+          outcome = { kind: 'already-claimed', message: '今天已签到' }
+        } else {
+          // 状态查询失败（status 为 null）时仍然尝试领取：
+          // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
+          outcome = await claim(credential, product)
+        }
+      }
+    } catch (error) {
+      deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 失败: ${String(error)}`)
+      outcome = {
+        kind: 'failed', code: -1,
+        message: error instanceof Error ? error.message : String(error),
+      }
+    }
+    outcomes.push(outcome)
+    results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+  }
+  return { results, summary: computeClaimSummary(outcomes) }
+}
+
+/**
  * 注册 Jet Hub 管理 API 端点。
  * 使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。
  */
@@ -73,6 +231,7 @@ export function registerJetHubRpc(
   pool: AccountPool,
   codearts: CodeArtsAuth,
   buddy: BuddyAuth,
+  workbuddy: BuddyAuth,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -144,24 +303,28 @@ export function registerJetHubRpc(
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
 
-        // Buddy 两步登录：只获取 loginUrl 和 state 立即返回，
-        // 后台用同一个 state 异步执行完整登录流程
-        if (provider === 'buddy') {
+        // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
+        // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
+        // 完整登录流程。两者的差异只在产品配置（platform、登录 URL 附加
+        // 参数、X-Product-Code、User-Agent），全部由 product 承载。
+        const product = productById(provider)
+        if (product !== undefined) {
           let state: string
           let authUrl: string
           try {
-            const authState = await fetchAuthState()
+            const authState = await fetchAuthState(undefined, undefined, product)
             state = authState.state
-            authUrl = authState.authUrl
+            // WorkBuddy 的登录 URL 需要追加 version 与 loginSessionId
+            authUrl = decorateLoginUrl(authState.authUrl, product)
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error)
-            throw new Error(`无法获取 CodeBuddy 登录地址（Host 网络请求失败）：${reason}`)
+            throw new Error(`无法获取 ${product.displayName} 登录地址（Host 网络请求失败）：${reason}`)
           }
           const ref = credentialRef(refName)
           // 先在 pool 中添加启用的占位条目（无凭据），方便客户端 login.poll 检测到
           await pool.addAccount({
             id,
-            provider: 'buddy',
+            provider: product.id,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -169,9 +332,10 @@ export function registerJetHubRpc(
             createdAt: Date.now(),
           })
           // 后台异步执行完整登录流程，使用同一个 state
-          runBuddyLoginFlow({ openBrowser: () => {}, state }).then(async (flow) => {
+          runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
-            buddy.scheduleRefresh()
+            // 续期定时器归属该产品自己的服务实例
+            ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
             await pool.updateAccount(id, {
               nickname: credential?.nickname ?? id,
@@ -181,7 +345,7 @@ export function registerJetHubRpc(
               refreshable: Boolean(credential?.refresh_token),
             })
           }).catch((err) => {
-            ctx.logger.warn(`[jet-hub] background buddy login failed for ${id}: ${err}`)
+            ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${err}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
             void pool.removeAccount(id).catch(() => {})
           })
@@ -277,6 +441,37 @@ export function registerJetHubRpc(
         const req = payload as RpcResetAllRequest
         const value = await resetAllAccounts(pool, req.provider)
         return { ok: true, value }
+      }
+
+      // ── 每日签到（积分领取）──
+      // 查询某 provider 下全部启用账号的签到状态。
+      case 'credits.status': {
+        const req = payload as RpcCreditsStatusRequest
+        const product = productById(req.provider)
+        if (product === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const accounts = await pool.listAccounts(req.provider)
+        const results = await collectCreditsStatus(accounts, product, {
+          resolve: (ref) => ctx.credentials.resolve(ref),
+          warn: (msg) => ctx.logger?.warn?.(msg),
+        })
+        return { ok: true, value: { accounts: results } satisfies RpcCreditsStatusResponse }
+      }
+
+      // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
+      case 'credits.claimAll': {
+        const req = payload as RpcCreditsClaimAllRequest
+        const product = productById(req.provider)
+        if (product === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const accounts = await pool.listAccounts(req.provider)
+        const value = await collectClaimResults(accounts, product, {
+          resolve: (ref) => ctx.credentials.resolve(ref),
+          warn: (msg) => ctx.logger?.warn?.(msg),
+        })
+        return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
       }
 
       default:

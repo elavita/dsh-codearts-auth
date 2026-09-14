@@ -33,6 +33,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { BuddyAdapter } from './buddy-adapter.js'
 import { CodeArtsAdapter, isRateLimited } from './llm-adapter.js'
+import { productById } from './product.js'
 import type { BuddyCredential } from './buddy.js'
 import type {
   CodeArtsCredential,
@@ -114,11 +115,17 @@ async function probeWithAdapter(
   //
   // refresh 设为 no-op：探测不应触发全局续期流程（那会影响其他账号与
   // 其他并发会话），凭据真的过期就让它以 AUTH 失败并如实上报。
-  const adapter = entry.provider === 'buddy'
+  // CodeBuddy 系（buddy / workbuddy）必须都走 BuddyAdapter，并按各自的
+  // 产品配置发请求。此前只判断 `provider === 'buddy'`：workbuddy 会落入
+  // else 分支而用 CodeArtsAdapter（华为云 HMAC 签名 + 错误端点）去发
+  // WorkBuddy 凭据，必然失败。改用 productById 判定，一次覆盖两个产品。
+  const product = productById(entry.provider)
+  const adapter = product !== undefined
     ? new BuddyAdapter({
         credentialRef: ref,
         resolveCredential: async () => credential as BuddyCredential,
         refresh: async () => {},
+        product,
       })
     : new CodeArtsAdapter({
         credentialRef: ref,

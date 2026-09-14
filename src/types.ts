@@ -175,6 +175,52 @@ export interface RpcResetResponse {
   accountCount: number
 }
 
+/**
+ * ========================================
+ * 每日签到（积分领取）
+ * ========================================
+ */
+
+/** RPC: 查询签到状态请求 */
+export interface RpcCreditsStatusRequest {
+  provider: string
+}
+/** 单个账号的签到状态 */
+export interface RpcCreditsAccountStatus {
+  accountId: string
+  nickname: string
+  /** 状态查询失败（网络错误/凭据损坏）时为 null */
+  status: import('./credits.js').CheckinStatus | null
+}
+/** RPC: 查询签到状态响应 */
+export interface RpcCreditsStatusResponse {
+  accounts: RpcCreditsAccountStatus[]
+}
+
+/** RPC: 一键领取积分请求 */
+export interface RpcCreditsClaimAllRequest {
+  provider: string
+}
+/** 单个账号的领取结果 */
+export interface RpcCreditsClaimAccountResult {
+  accountId: string
+  nickname: string
+  outcome: import('./credits.js').ClaimOutcome
+}
+/** 领取汇总 */
+export interface RpcCreditsClaimSummary {
+  claimed: number
+  totalCredit: number
+  alreadyClaimed: number
+  inactive: number
+  failed: number
+}
+/** RPC: 一键领取积分响应 */
+export interface RpcCreditsClaimAllResponse {
+  results: RpcCreditsClaimAccountResult[]
+  summary: RpcCreditsClaimSummary
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string
