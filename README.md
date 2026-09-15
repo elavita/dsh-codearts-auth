@@ -46,15 +46,18 @@ dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codea
 依赖（指向本目录）：
 
 ```sh
-pnpm build
+pnpm build:all
 dsh plugin --profile <name> install <path-to-this-repo>
 ```
 
 > `dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:` 依赖运行
-> `prepare` 脚本，因此必须先手动执行 `pnpm build` 生成 `lib/`，否则 dsh 启动时
+> `prepare` 脚本，因此必须先手动执行 `pnpm build:all` 生成 `lib/`，否则 dsh 启动时
 > 报 `ERR_MODULE_NOT_FOUND: ... dsh-codearts-auth/lib/index.js`。
+> 注意必须用 `build:all` 而非 `build`：后者只编译宿主侧，不产出
+> `lib/client/jet-hub.js`。
 
-每次修改 `src/` 后都需要重新执行 `pnpm build`——dsh 启动时不会自动重建。
+每次修改 `src/` 或 `plugin-src/` 后都需要重新执行 `pnpm build:all`——dsh 启动时
+不会自动重建。
 
 ### 通用说明
 
@@ -133,22 +136,31 @@ Tokens 福利）。
 - `pnpm test` — 单元测试（快速，无网络）。
 - `pnpm test:e2e` — 针对华为线上端点的真实登录流程；需要在打开的浏览器中由人工
   点击授权按钮（续期为静默刷新，无需再次点击）。
-- `pnpm typecheck`、`pnpm build`。
+- `pnpm typecheck`、`pnpm build:all`。
 
 ### 构建
 
 - `pnpm build` — 用 tsc 将 `src/` 编译到 `lib/`（生成 `.js`、`.d.ts` 和 source
-  map）。插件入口是 `lib/index.js`，而 `lib/` 已被 gitignore，因此构建是安装或
-  运行前的必需步骤。
+  map）。插件**宿主侧**入口是 `lib/index.js`。
+- `pnpm build:client` — 用 esbuild 将 `plugin-src/client/` 打包为
+  `lib/client/jet-hub.js`（Jet Hub 设置页的客户端 bundle，由 `exports["./client"]`
+  引用）。它**不在** `tsc` 的编译范围内，必须单独构建。
+- `pnpm build:all` — 依次执行上面两步（`build` + `build:client`），是完整的构建。
 - `pnpm typecheck` — 只做类型检查（`tsc --noEmit`），不产出文件，可在构建前快速
   验证。
 
-每次修改 `src/` 后都需要重新执行 `pnpm build`——dsh 启动时不会自动重建。
+`lib/` 已被 gitignore，因此构建是安装或运行前的必需步骤。只执行 `pnpm build`
+会漏掉客户端 bundle，dsh 启动时会因 `exports["./client"]` 指向的文件不存在而
+加载失败（Jet Hub 设置页不显示），请改用 `pnpm build:all`。
+
+每次修改 `src/` 或 `plugin-src/` 后都需要重新执行 `pnpm build:all`——dsh 启动时
+不会自动重建。
 
 ### 安装到 profile 之前先构建
 
 详见「安装」小节。`dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:`
-依赖运行 `prepare` 脚本，因此必须先 `pnpm build` 生成 `lib/`。
+依赖运行 `prepare` 脚本，因此必须先 `pnpm build:all` 生成 `lib/`（含客户端
+bundle）。
 
 ## 工作原理
 
