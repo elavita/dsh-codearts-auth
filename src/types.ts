@@ -71,6 +71,12 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
 /** Jet Hub 在 ctx.settings 中的 schema */
 export interface JetHubConfig {
   accounts: ProviderAccountEntry[]
+  /**
+   * 模型黑名单：provider id → 模型 id → true。
+   *
+   * **黑名单制**：只有键存在且为 true 的模型被隐藏，未记录的模型默认打开。
+   */
+  disabledModels?: Record<string, Record<string, boolean>>
 }
 
 /** RPC 端点请求/响应类型 */
@@ -219,6 +225,49 @@ export interface RpcCreditsClaimSummary {
 export interface RpcCreditsClaimAllResponse {
   results: RpcCreditsClaimAccountResult[]
   summary: RpcCreditsClaimSummary
+}
+
+/**
+ * ========================================
+ * 模型列表可见性（黑名单开关）
+ * ========================================
+ */
+
+/** RPC: 列出某 provider 的模型请求 */
+export interface RpcModelListRequest {
+  provider: string
+}
+
+/**
+ * 单个模型在设置页的展示条目。
+ *
+ * `disabled` 由服务端按黑名单回填，`name` 是适配器播报的展示名 ——
+ * 两者都取自**权威来源**（适配器的 listModels），而不是前端自己再拼一份
+ * 模型清单，否则远端模型池变化时设置页与对话框会显示两套不同的列表。
+ */
+export interface RpcModelListEntry {
+  id: string
+  name: string
+  /** true = 已关闭（不出现在对话框的模型选择里）。 */
+  disabled: boolean
+}
+
+/** RPC: 列出某 provider 的模型响应 */
+export interface RpcModelListResponse {
+  models: RpcModelListEntry[]
+}
+
+/** RPC: 打开/关闭某个模型请求 */
+export interface RpcModelSetDisabledRequest {
+  provider: string
+  modelId: string
+  disabled: boolean
+}
+
+/** RPC: 打开/关闭某个模型响应（回传写入后的完整黑名单，便于前端校验） */
+export interface RpcModelSetDisabledResponse {
+  provider: string
+  disabledModels: Record<string, boolean>
 }
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */

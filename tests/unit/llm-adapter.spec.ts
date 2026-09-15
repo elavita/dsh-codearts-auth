@@ -23,6 +23,8 @@ function makeAdapter(overrides: {
   refresh?: () => Promise<void>
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
+  accountPool?: unknown
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : validCredential
   const refresh = overrides.refresh ?? (async () => {})
@@ -33,8 +35,17 @@ function makeAdapter(overrides: {
     refresh: async () => { await refresh(); credential = validCredential },
     fetchImpl,
     fetchRemoteModels: overrides.fetchRemoteModels,
+    ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
   return adapter
+}
+
+/** 只实现 listModels 所需方法的账号池替身：对指定 provider 报告黑名单。 */
+function poolWithDisabled(provider: string, ids: string[]) {
+  const disabled = new Set(ids)
+  return {
+    disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
+  }
 }
 
 describe('CodeArtsAdapter', () => {
@@ -647,6 +658,47 @@ describe('CodeArtsAdapter', () => {
     expect(ids).not.toContain('Qwen3.5-397B-A17B-VL')
     // 普通模型不受影响。
     expect(ids).toContain('GLM-5.2')
+  })
+
+  /**
+   * 模型黑名单：Jet Hub 的「显示列表」开关关闭某模型后，它必须从
+   * listModels 的播报里消失 —— 对话框模型选择器读的正是这份数据。
+   */
+  it('hides models the user disabled from listModels', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2' },
+        { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
+        { id: 'openpangu-2.0-pro', name: 'openpangu-2.0-pro' },
+      ],
+      accountPool: poolWithDisabled('codearts', ['GLM-5.2']),
+    })
+    const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+    expect(ids).not.toContain('GLM-5.2')
+    // 未关闭的模型保持原样与原有顺序
+    expect(ids).toEqual(['deepseek-v4-flash', 'openpangu-2.0-pro'])
+  })
+
+  it('an empty disabled set leaves listModels untouched', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', []) })
+    const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+    expect(ids).toContain('GLM-5.2')
+    expect(ids).toContain('deepseek-v4-flash')
+  })
+
+  it('blacklist is keyed by provider: another route\'s entries do not leak in', async () => {
+    // 池里只有 buddy 的黑名单，codearts 路由不该被它影响
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['GLM-5.2']) })
+    expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+  })
+
+  it('a disabled model still resolves and remains requestable (catalog is advisory)', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', ['GLM-5.2']) })
+    expect((await adapter.listModels('codearts')).map((m) => m.id)).not.toContain('GLM-5.2')
+    // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
+    const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
+    expect(resolved.id).toBe('GLM-5.2')
+    expect(resolved.context?.contextWindow).toBe(202752)
   })
 
   it('switches deepseek-v4 to DSML tool mode: no tools field, schema injected into system', async () => {

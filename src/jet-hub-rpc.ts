@@ -7,7 +7,8 @@
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
- *           credits.status / credits.claimAll
+ *           credits.status / credits.claimAll /
+ *           model.list / model.setDisabled
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -47,6 +48,10 @@ import type {
   RpcCreditsClaimAllRequest,
   RpcCreditsClaimAllResponse,
   RpcCreditsClaimSummary,
+  RpcModelListRequest,
+  RpcModelListResponse,
+  RpcModelSetDisabledRequest,
+  RpcModelSetDisabledResponse,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -220,6 +225,18 @@ export async function collectClaimResults(
     results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
   }
   return { results, summary: computeClaimSummary(outcomes) }
+}
+
+/**
+ * 读取 `ctx.llm` 用于枚举 provider 的模型目录。
+ *
+ * 用 `ctx.get` 而不是 `inject`：Jet Hub 的账号管理是主要职责，模型开关只是
+ * 附加能力；llm 服务缺失时账号面板仍应可用，只是「显示列表」按钮报错。
+ */
+function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Array<{ id: string; name: string }>> } | undefined {
+  return ctx.get('llm') as
+    | { listModels(provider: string): Promise<Array<{ id: string; name: string }>> }
+    | undefined
 }
 
 /**
@@ -472,6 +489,56 @@ export function registerJetHubRpc(
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
         return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+      }
+
+      // ── 模型列表可见性（黑名单开关）──
+      //
+      // 列表来自 `ctx.llm.listModels()`——**适配器播报的权威目录**，正是
+      // 对话框模型选择器读的同一份数据（会话控制器的 buildModelCatalog）。
+      // 这样设置页展示的模型集合与实际可选集合永远一致，不会出现
+      // 「设置在某个模型上，选择器里却找不到它」。
+      case 'model.list': {
+        const req = payload as RpcModelListRequest
+        const llm = llmServiceOf(ctx)
+        if (llm === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
+        }
+        let models: Array<{ id: string; name: string }>
+        try {
+          models = await llm.listModels(req.provider)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          return { ok: false, error: { code: 'bad-request', message: `读取模型列表失败：${reason}` } }
+        }
+        // 黑名单直接读账号池的进程内副本：开关写入后无需重建适配器，
+        // 下一次 listModels 就会应用新的过滤结果。
+        const disabledMap = pool.listDisabledModels(req.provider)
+        const value: RpcModelListResponse = {
+          models: models.map((model) => ({
+            id: model.id,
+            name: model.name,
+            disabled: disabledMap[model.id] === true,
+          })),
+        }
+        return { ok: true, value }
+      }
+
+      // 打开/关闭某个模型。写入后**不重建适配器**：适配器的 listModels 每次
+      // 都直接读账号池的黑名单，因此下一轮模型目录刷新即生效。
+      case 'model.setDisabled': {
+        const req = payload as RpcModelSetDisabledRequest
+        if (typeof req.provider !== 'string' || typeof req.modelId !== 'string' || req.modelId.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 与 modelId 必填' } }
+        }
+        await pool.setModelDisabled(req.provider, req.modelId, req.disabled === true)
+        ctx.logger.info(
+          `[jet-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
+        )
+        const value: RpcModelSetDisabledResponse = {
+          provider: req.provider,
+          disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
       }
 
       default:

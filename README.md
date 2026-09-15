@@ -12,6 +12,10 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   另支持「一键领取积分」（每日签到）。
 - **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
 
+三个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
+见 [模型列表开关](#模型列表开关黑名单)。
+
 ## 安装
 
 该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
@@ -255,6 +259,30 @@ Jet Hub（设置页）的账号面板按 provider 分组展示，WorkBuddy 是�
   但**前端尚无消费者**：`plugin-src/client/jet-hub.js` 只调用 `credits.claimAll`，
   `credits.status` 目前仅供外部脚本或直接 RPC 调用使用。
 - 对应 LLM provider 的设置命名空间为 `llm-workbuddy`。
+
+### 模型列表开关（黑名单）
+
+Jet Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的**全部模型**，每个模型
+后面带一个开关，**默认打开**。关闭后该模型不再出现在对话框的模型选择列表里。
+
+采用**黑名单制**：只有被显式关闭的模型会被隐藏，未记录的模型（含服务端后续新增的
+模型）一律默认显示。这与白名单制的关键差别在于——新模型上线时无需任何配置就会
+自动出现在选择器里，不会被静默挡在门外。
+
+- 开关状态持久化在 `jet-hub` settings 命名空间的 `disabledModels` 字段
+  （形如 `{ buddy: { 'glm-5.2': true } }`），与账号池同处一个 namespace。
+- 模型列表来自 `ctx.llm.listModels()`，**即对话框模型选择器读取的同一份目录**
+  （会话控制器的 `buildModelCatalog`），因此设置页展示的模型与实际可选集合始终
+  一致，不会出现「设置里有、选择器里没有」的错位。
+- 过滤发生在适配器的 `listModels`（`src/llm-adapter.ts` / `src/buddy-adapter.ts`），
+  每次调用都直接读账号池的黑名单，因此**改开关后下一轮模型目录刷新即生效**，
+  无需重启或重建适配器。
+- **只影响目录播报，不改变路由能力**：被关闭的模型仍可被 `resolveModel` 解析、
+  仍能正常收发请求。这是 DSH 对 `listModels` 的约定（目录是建议性的，缺省不构成
+  请求拒绝）。好处是已有会话若正用着某个被关闭的模型，不会被强制中断。
+- 开关按 provider 隔离，CodeBuddy / WorkBuddy / CodeArts 三份黑名单互不影响。
+- 相关 RPC 端点：`model.list`（列出模型并回填 `disabled`）、`model.setDisabled`
+  （打开/关闭单个模型），实现见 `src/jet-hub-rpc.ts`。
 
 ### 一键领取积分（每日签到）
 

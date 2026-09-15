@@ -551,7 +551,13 @@ export class BuddyAdapter extends LlmAdapter {
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
-    return source.map((model) => ({
+    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+    // 按本适配器的产品 id 取表，CodeBuddy 与 WorkBuddy 的开关互不影响。
+    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+    const listed = disabled === undefined || disabled.size === 0
+      ? source
+      : source.filter((model) => !disabled.has(model.id))
+    return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
       name: model.name,

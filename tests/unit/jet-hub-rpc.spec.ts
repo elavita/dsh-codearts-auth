@@ -3,8 +3,10 @@ import {
   collectClaimResults,
   collectCreditsStatus,
   computeClaimSummary,
+  registerJetHubRpc,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
+import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus } from '../../src/credits.js'
 import { WORKBUDDY } from '../../src/product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -355,5 +357,201 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
 
     expect(order).toEqual(['entry-0', 'entry-1', 'entry-2'])
     expect(response.results.map(r => r.accountId)).toEqual(['a', 'b', 'c'])
+  })
+})
+
+/**
+ * model.list / model.setDisabled 端点。
+ *
+ * 这两个端点是 Jet Hub「显示列表」按钮的唯一数据通道，同时串起三件必须
+ * 一起正确的事：
+ * 1. 列表来自 `ctx.llm.listModels()`（对话框模型选择器读的同一份目录）；
+ * 2. 黑名单经 AccountPool 持久化；
+ * 3. 关闭后的模型真的从下一次 listModels 的结果里消失。
+ *
+ * 因此这里用「注册端点 → 通过 HTTP 请求调用 → 断言响应」的方式做端到端
+ * 验证，而不是分别测两个函数——两者的衔接正是最容易出错的地方。
+ */
+describe('model.list / model.setDisabled 端点', () => {
+  /** 从 connection.fetch.register 捕获到的处理器。 */
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 构造带 RPC 端点所需的 ctx 替身，返回注册进去的 fetch 处理器。 */
+  function registerEndpoints(options: {
+    models: Array<{ id: string; name: string }>
+    disabledModels?: Record<string, Record<string, boolean>>
+    /** listModels 抛错时用于验证错误路径。 */
+    listModelsError?: string
+    /** 省略 llm 服务（验证降级行为）。 */
+    withoutLlm?: boolean
+  }) {
+    // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
+    // 「整体 replace」。
+    let stored: Record<string, unknown> = {
+      accounts: [],
+      ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
+    }
+    let handler: Handler | undefined
+
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return {
+            fetch: {
+              register: (config: { fetch: Handler }) => { handler = config.fetch },
+            },
+          }
+        }
+        if (key === 'llm' && options.withoutLlm !== true) {
+          return {
+            listModels: async (provider: string) => {
+              if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              return options.models.map(m => ({ ...m, provider }))
+            },
+          }
+        }
+        return undefined
+      },
+      logger: { warn: () => {}, info: () => {} },
+    }
+
+    registerJetHubRpc(ctx as never, pool, {} as never, {} as never, {} as never)
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    /** 调用一个端点方法，返回解包后的 result。 */
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'rpc-1',
+          method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return { call, pool, storedValue: () => stored }
+  }
+
+  const MODELS = [
+    { id: 'glm-5.2', name: 'GLM-5.2' },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { id: 'hy3', name: 'Hy3' },
+  ]
+
+  it('model.list 回传 llm 的模型目录，并把黑名单回填为 disabled', async () => {
+    const { call } = registerEndpoints({
+      models: MODELS,
+      disabledModels: { buddy: { hy3: true } },
+    })
+
+    const result = await call('model.list', { provider: 'buddy' })
+
+    expect(result.ok).toBe(true)
+    expect(result.value).toEqual({
+      models: [
+        { id: 'glm-5.2', name: 'GLM-5.2', disabled: false },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', disabled: false },
+        { id: 'hy3', name: 'Hy3', disabled: true },
+      ],
+    })
+  })
+
+  it('未配置黑名单时全部模型默认打开（黑名单制）', async () => {
+    const { call } = registerEndpoints({ models: MODELS })
+    const result = await call('model.list', { provider: 'workbuddy' })
+    const models = (result.value as { models: Array<{ disabled: boolean }> }).models
+
+    expect(models.every(m => m.disabled === false)).toBe(true)
+  })
+
+  it('黑名单按 provider 隔离', async () => {
+    const { call } = registerEndpoints({
+      models: MODELS,
+      disabledModels: { buddy: { hy3: true } },
+    })
+
+    const buddy = await call('model.list', { provider: 'buddy' })
+    const workbuddy = await call('model.list', { provider: 'workbuddy' })
+
+    const flagOf = (result: unknown, id: string) =>
+      (result as { models: Array<{ id: string; disabled: boolean }> }).models.find(m => m.id === id)!.disabled
+
+    expect(flagOf(buddy.value, 'hy3')).toBe(true)
+    // 另一个 provider 的同名模型不受影响
+    expect(flagOf(workbuddy.value, 'hy3')).toBe(false)
+  })
+
+  it('model.setDisabled 持久化到 settings，并在后续 model.list 中生效', async () => {
+    const { call, storedValue } = registerEndpoints({ models: MODELS })
+
+    const set = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    expect(set.ok).toBe(true)
+    expect(set.value).toEqual({ provider: 'buddy', disabledModels: { hy3: true } })
+    // 落盘内容可核对：
+    expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+
+    const list = await call('model.list', { provider: 'buddy' })
+    const hy3 = (list.value as { models: Array<{ id: string; disabled: boolean }> })
+      .models.find(m => m.id === 'hy3')!
+    expect(hy3.disabled).toBe(true)
+  })
+
+  it('重新打开时从黑名单移除（写 false 不残留）', async () => {
+    const { call, storedValue } = registerEndpoints({
+      models: MODELS,
+      disabledModels: { buddy: { hy3: true } },
+    })
+
+    const set = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+
+    expect(set.value).toEqual({ provider: 'buddy', disabledModels: {} })
+    expect(storedValue().disabledModels).toEqual({})
+  })
+
+  it('model.setDisabled 缺少 modelId 时返回 bad-request 而不是静默成功', async () => {
+    const { call } = registerEndpoints({ models: MODELS })
+    const result = await call('model.setDisabled', { provider: 'buddy', modelId: '' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('modelId')
+  })
+
+  it('llm 服务不可用时 model.list 返回可读错误（账号面板不受影响）', async () => {
+    const { call } = registerEndpoints({ models: MODELS, withoutLlm: true })
+    const result = await call('model.list', { provider: 'buddy' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('llm 服务不可用')
+  })
+
+  it('适配器 listModels 抛错时返回可读错误而不是裸 500', async () => {
+    const { call } = registerEndpoints({ models: MODELS, listModelsError: '令牌已过期' })
+    const result = await call('model.list', { provider: 'buddy' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('令牌已过期')
   })
 })

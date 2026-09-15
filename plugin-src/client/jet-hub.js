@@ -51,6 +51,17 @@ const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不
   + '适用于你已确认额度恢复、只想清掉显示的情况。';
 const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
 
+/**
+ * 「显示列表」按钮的说明。
+ *
+ * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
+ * - 关闭只是**从对话框的模型选择里隐藏**，模型本身仍然存在、可随时再打开；
+ * - 采用黑名单制，没被关掉的模型（含服务端后续新增的）默认都是打开的。
+ */
+const MODEL_LIST_HELP = '列出该 Provider 的全部模型。每个模型后面的开关默认打开；'
+  + '关闭后，该模型不再出现在对话框的模型选择列表里（黑名单制：只有被关闭的才隐藏，'
+  + '其余含服务端新增的模型一律默认显示）。此设置持久化保存，可随时重新打开。';
+
 /** 把一次重测/重置的响应汇总成一行可读文案。 */
 function summarizeProbe(kind, res) {
   if (kind === 'reset' || kind === 'resetAll') {
@@ -137,6 +148,179 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy }) {
       }, '删除')));
 }
 
+/**
+ * 单个模型的开关。
+ *
+ * 刻意不做本地乐观更新：模型列表与黑名单都以 Host 为准（可能是远端拉取的
+ * 结果），本地猜测状态容易与真实持久化结果分叉。这里等 RPC 返回后再翻状态，
+ * 期间禁用开关，保证界面上看到的就是服务端已接受的。
+ */
+function ModelToggle({ model, busy, onToggle }) {
+  return React.createElement('label', {
+    className: 'dim-jh-modelRow',
+    'data-disabled': model.disabled ? 'true' : 'false',
+    title: model.id,
+  },
+    React.createElement('span', { className: 'dim-jh-modelInfo' },
+      React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
+      React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
+    React.createElement('input', {
+      type: 'checkbox',
+      className: 'dim-jh-switch',
+      role: 'switch',
+      checked: !model.disabled,
+      disabled: busy,
+      'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
+      onChange: () => onToggle(model.id, !model.disabled),
+    }));
+}
+
+/**
+ * 模型列表弹窗：点击「显示列表」后以 modal 形式浮出。
+ *
+ * 数据全部来自 `model.list` RPC —— 也就是适配器 `listModels()` 播报的同一份
+ * 目录（对话框模型选择器读的正是它）。因此这里列出的模型与可选模型一一对应，
+ * 不会出现「设置页有、选择器里没有」的错位。
+ *
+ * 用 modal 而不是内联展开：开关列表可能有几十项，内联会挤占账号区的空间，
+ * 也让「账号池」与「模型可见性」两件不相关的事在视觉上混在一起。
+ */
+function ModelListPanel({ provider, rpcCall, onClose }) {
+  const [models, setModels] = React.useState(null);
+  const [phase, setPhase] = React.useState('loading');
+  const [error, setError] = React.useState(null);
+  // 单次开关操作的失败提示。与 `error` 分开：列表本身的读取失败要用整页
+  // 错误态替换，而单次切换失败只需顶部提示、列表必须保留。
+  const [toggleError, setToggleError] = React.useState(null);
+  // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
+  const [busyIds, setBusyIds] = React.useState(() => new Set());
+  const mounted = React.useRef(true);
+
+  const load = React.useCallback(async () => {
+    setPhase('loading');
+    setError(null);
+    try {
+      const res = await rpcCall('model.list', { provider });
+      if (!mounted.current) return;
+      setModels(res.models || []);
+      setPhase('ready');
+    } catch (caught) {
+      if (!mounted.current) return;
+      setError(caught?.message || '无法读取模型列表');
+      setPhase('error');
+    }
+  }, [provider, rpcCall]);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    void load();
+    return () => { mounted.current = false; };
+  }, [load]);
+
+  // ESC 关闭。挂在 document 上而不是弹窗上：焦点可能落在任意一个开关上，
+  // 只监听弹窗自身的 keydown 会漏掉这些按键。
+  React.useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  const toggleModel = async (modelId, disabled) => {
+    setBusyIds(prev => new Set(prev).add(modelId));
+    setToggleError(null);
+    try {
+      await rpcCall('model.setDisabled', { provider, modelId, disabled });
+      if (!mounted.current) return;
+      setModels(prev => (prev || []).map(m => (m.id === modelId ? { ...m, disabled } : m)));
+    } catch (caught) {
+      console.error('[jet-hub] toggle model failed:', caught);
+      if (!mounted.current) return;
+      // 开关切换失败不能把整张表替换成错误页——用户会以为模型列表没了。
+      // 保留列表，只在顶部提示这次操作失败。
+      setToggleError(caught?.message || '切换模型显示状态失败');
+    } finally {
+      if (mounted.current) {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
+        });
+      }
+    }
+  };
+
+  const all = models || [];
+  const hiddenCount = all.filter(m => m.disabled).length;
+  const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
+
+  const dialog = React.createElement('div', {
+    className: 'dim-jh-modalOverlay',
+    // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': `${providerLabel} 模型列表`,
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' },
+          React.createElement('strong', null, '模型列表'),
+          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, providerLabel),
+          phase === 'ready'
+            ? React.createElement('span', { className: 'dim-jh-modelPanelCount' },
+                `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
+            : null),
+        React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            disabled: phase === 'loading',
+            onClick: () => void load(),
+          }, phase === 'loading' ? '读取中…' : '刷新'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            onClick: onClose,
+          }, '完成'))),
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      toggleError
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': 'error',
+            role: 'alert',
+          }, React.createElement('div', null, toggleError))
+        : null,
+      phase === 'error'
+        ? React.createElement('div', { className: 'dim-jh-modalBody' },
+            React.createElement('div', { className: 'dim-jh-empty' },
+              React.createElement('p', null, error),
+              React.createElement('button', { className: 'dim-jh-btn', onClick: () => void load() }, '重新读取')))
+        : phase === 'loading'
+          ? React.createElement('div', { className: 'dim-jh-modalBody' },
+              React.createElement('div', { className: 'dim-jh-empty' }, '正在读取模型列表…'))
+          : all.length === 0
+            ? React.createElement('div', { className: 'dim-jh-modalBody' },
+                React.createElement('div', { className: 'dim-jh-empty' },
+                  React.createElement('p', null, '该 Provider 当前没有可用的模型。')))
+            : React.createElement('div', { className: 'dim-jh-modalBody' },
+                React.createElement('div', { className: 'dim-jh-modelList' },
+                  all.map(model => React.createElement(ModelToggle, {
+                    key: model.id,
+                    model,
+                    busy: busyIds.has(model.id),
+                    onToggle: (id, disabled) => void toggleModel(id, disabled),
+                  }))))));
+
+  // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠
+  // position: fixed 覆盖全屏。**刻意不用 createPortal** —— 客户端模块表由
+  // 宿主注入（staticModules 种子表），本仓库无法离线确认 `react-dom` 是否在
+  // 其中；一旦不在，require 会抛「missed the module table」，弹窗直接白屏。
+  // 现有登录弹窗已证明 fixed 定位在这些面板里工作正常。
+  return dialog;
+}
+
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -172,6 +356,9 @@ function ProviderPanel({ provider, rpcCall }) {
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
   const [claimNotice, setClaimNotice] = React.useState(null);
+  // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
+  // 每次进入面板都白白发一次 model.list 请求。
+  const [showModels, setShowModels] = React.useState(false);
   // CodeBuddy / WorkBuddy 支持每日签到积分，其他 provider 不渲染领取按钮。
   const supportsCredits = CREDITS_PROVIDERS.includes(provider);
 
@@ -313,6 +500,11 @@ function ProviderPanel({ provider, rpcCall }) {
       React.createElement('h2', { style: { margin: 0, fontSize: 16, fontWeight: 600 } },
         `${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号管理`),
       React.createElement('div', { className: 'dim-jh-headerActions' },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: MODEL_LIST_HELP,
+          onClick: () => setShowModels(true),
+        }, '显示列表'),
         supportsCredits
           ? React.createElement('button', {
               className: 'dim-jh-btn',
@@ -378,7 +570,16 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
-              }))));
+              }))),
+    // 模型列表以 modal 渲染：它是覆盖层，放在账号区之后只是组件树的书写顺序，
+    // 实际靠 fixed 定位浮在整个面板之上，不再挤占账号池的版面。
+    showModels
+      ? React.createElement(ModelListPanel, {
+          provider,
+          rpcCall,
+          onClose: () => setShowModels(false),
+        })
+      : null);
 }
 
 export function JetHubPage({ close, rpcCall }) {

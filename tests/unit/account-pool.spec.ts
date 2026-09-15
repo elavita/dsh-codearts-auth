@@ -12,22 +12,32 @@ import type { ProviderAccountEntry } from '../../src/types.js'
  */
 function createMockContext(
   initialAccounts: ProviderAccountEntry[] = [],
-  options: { staleReads?: boolean } = {},
+  options: { staleReads?: boolean; initialDisabledModels?: Record<string, Record<string, boolean>> } = {},
 ) {
-  let stored: { accounts?: ProviderAccountEntry[] } = { accounts: initialAccounts }
+  let stored: { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, Record<string, boolean>> } = {
+    accounts: initialAccounts,
+    ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
+  }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
-  let visible: { accounts?: ProviderAccountEntry[] } = stored
+  let visible = stored
   const replaceCalls: Array<ProviderAccountEntry[]> = []
+  // 每次 replace 的完整载荷：用于断言「写账号时没有把黑名单抹掉」这类
+  // 整体替换语义带来的数据丢失。
+  const replacePayloads: Array<Record<string, unknown>> = []
   const mockSettings = {
     register: (_ns: string, _schema: unknown) => ({
       get: () => (options.staleReads ? visible : stored),
-      replace: async (value: { accounts?: ProviderAccountEntry[] }) => {
+      replace: async (value: {
+        accounts?: ProviderAccountEntry[]
+        disabledModels?: Record<string, Record<string, boolean>>
+      }) => {
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
           visible = stored
         }
         stored = value
         replaceCalls.push(value.accounts ?? [])
+        replacePayloads.push(value as Record<string, unknown>)
       },
     }),
     describe: () => [{ ns: 'jet-hub', value: stored }],
@@ -35,6 +45,7 @@ function createMockContext(
   const mockCredentials = new Map<string, string>()
   return {
     replaceCalls,
+    replacePayloads,
     logger: { warn: () => {}, info: () => {} },
     get: (key: string) => key === 'settings' ? mockSettings : undefined,
     credentials: {
@@ -530,5 +541,124 @@ describe('pruneAccountsWithForeignDomain', () => {
     const left = await pool.listAllAccounts()
     expect(left).toHaveLength(1)
     expect(left[0]!.id).toBe('workbuddy_account_b')
+  })
+})
+
+/**
+ * 模型黑名单（Jet Hub 的「显示列表」开关）。
+ *
+ * 语义核心是**黑名单制**：只有被显式关闭的模型会隐藏，未记录的模型
+ * 一律默认打开。这保证服务端新增模型时不需要任何配置就能出现在选择器里
+ * —— 白名单制会把新模型静默挡在门外，是这套开关最容易踩的坑。
+ */
+describe('AccountPool 模型黑名单', () => {
+  it('未配置时没有任何模型被关闭（默认全开）', () => {
+    const pool = new AccountPool(createMockContext() as never)
+    expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    expect(pool.listDisabledModels('buddy')).toEqual({})
+  })
+
+  it('关闭模型后该模型进入黑名单，其余模型不受影响', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+
+    const disabled = pool.disabledModelsFor('buddy')
+    expect(disabled.has('glm-5.2')).toBe(true)
+    // 没被关掉的模型默认打开 —— 黑名单制的关键断言
+    expect(disabled.has('deepseek-v4-flash')).toBe(false)
+    expect(disabled.has('hy3')).toBe(false)
+  })
+
+  it('重新打开时删除条目，而不是写入 false', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('buddy', 'glm-5.2', false)
+
+    expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    // 打开后 provider 表变空，应当整体从配置里消失（不留 { buddy: {} } 噪音）
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.disabledModels).toEqual({})
+  })
+
+  it('不同 provider 的黑名单互不影响', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('workbuddy', 'gpt-5.4', true)
+
+    expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    expect([...pool.disabledModelsFor('workbuddy')]).toEqual(['gpt-5.4'])
+    expect(pool.disabledModelsFor('codearts').size).toBe(0)
+  })
+
+  it('关闭多个模型后全部保留', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('buddy', 'hy3', true)
+    await pool.setModelDisabled('buddy', 'kimi-k2.6', true)
+
+    expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
+  })
+
+  it('从已有配置载入黑名单', () => {
+    const pool = new AccountPool(createMockContext([], {
+      initialDisabledModels: { buddy: { 'glm-5.2': true } },
+    }) as never)
+    const disabled = pool.disabledModelsFor('buddy')
+    expect(disabled.has('glm-5.2')).toBe(true)
+    expect(disabled.size).toBe(1)
+  })
+
+  /**
+   * 回归：settings 的 replace() 是**整体替换**。写账号列表时若不带上
+   * disabledModels，用户刚设置的模型开关会被下一次账号操作（新增/删除/
+   * 限流标记）静默清空。
+   */
+  it('写账号列表时不会抹掉已有的黑名单', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.addAccount({
+      id: 'buddy-x', provider: 'buddy', nickname: 'X', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_X', createdAt: Date.now(), refreshable: true,
+    })
+
+    expect(ctx.replacePayloads.at(-1)!.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+    expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+
+  /** 反向回归：写黑名单时若丢掉账号列表，账号池会被清空。 */
+  it('写黑名单时不会抹掉账号列表', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.addAccount({
+      id: 'buddy-y', provider: 'buddy', nickname: 'Y', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_Y', createdAt: Date.now(), refreshable: true,
+    })
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+
+    expect(ctx.replacePayloads.at(-1)!.accounts).toHaveLength(1)
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('配置文件里的脏数据被忽略而不是抛错', () => {
+    // 模拟手工编辑过的/老版本的配置文件：数组、字符串、false 都应被丢弃
+    const pool = new AccountPool(createMockContext([], {
+      initialDisabledModels: {
+        buddy: { 'glm-5.2': true, 'hy3': false, 'bad': 'yes' } as never,
+        broken: ['glm-5.2'] as never,
+      },
+    }) as never)
+
+    // 只有显式 true 的条目生效
+    expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    // 结构非法的 provider 整层丢弃
+    expect(pool.disabledModelsFor('broken').size).toBe(0)
+  })
+
+  it('无 settings scope 时降级为内存态，不抛错', async () => {
+    const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
   })
 })

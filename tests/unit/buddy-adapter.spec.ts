@@ -48,6 +48,8 @@ function makeAdapter(overrides: {
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
   product?: BuddyProduct
+  /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
+  accountPool?: unknown
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -63,6 +65,7 @@ function makeAdapter(overrides: {
     ...overrides.fetchRemoteModels !== undefined ? { fetchRemoteModels: overrides.fetchRemoteModels } : {},
     ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
     ...overrides.product !== undefined ? { product: overrides.product } : {},
+    ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
 }
 
@@ -1343,5 +1346,67 @@ describe('产品兜底模型目录校正', () => {
     })
     const models = await adapter.listModels('workbuddy')
     expect(models.map((m) => m.id)).toEqual(['x', 'y'])
+  })
+})
+
+/**
+ * 模型黑名单对 listModels 的过滤。
+ *
+ * 这是「关闭开关 → 对话框不再显示该模型」这条链路的关键一环：
+ * /api/session 的模型目录正是通过 ctx.llm.listModels() → 适配器 listModels()
+ * 构建的。此处断言适配器确实把黑名单里的模型摘掉了。
+ */
+describe('BuddyAdapter 模型黑名单', () => {
+  /** 只实现 listModels 所需方法的账号池替身。 */
+  function poolWithDisabled(provider: string, ids: string[]) {
+    const disabled = new Set(ids)
+    return {
+      disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
+    } as never
+  }
+
+  it('被关闭的模型从列表中消失，其余保持原有顺序', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2', 'hy3']) })
+    const models = await adapter.listModels('buddy')
+    const ids = models.map((m) => m.id)
+
+    expect(ids).not.toContain('glm-5.2')
+    expect(ids).not.toContain('hy3')
+    // 未关闭的模型一个都不能少，且顺序不变（顺序即选择器的展示顺序）
+    expect(ids).toEqual(
+      CODEBUDDY.fallbackModels!.map((m) => m.id).filter((id) => id !== 'glm-5.2' && id !== 'hy3'),
+    )
+  })
+
+  it('空黑名单不改变列表（默认全开）', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', []) })
+    const models = await adapter.listModels('buddy')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+  })
+
+  it('没有账号池时不过滤（适配器可脱离账号池使用）', async () => {
+    const models = await makeAdapter().listModels('buddy')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+  })
+
+  it('黑名单按产品 id 隔离：workbuddy 的关闭项不影响 buddy', async () => {
+    const adapter = makeAdapter({
+      accountPool: {
+        // 只对 workbuddy 报告黑名单
+        disabledModelsFor: (value: string) => (value === 'workbuddy' ? new Set(['glm-5.2']) : new Set<string>()),
+      } as never,
+    })
+    const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+    expect(ids).toContain('glm-5.2')
+  })
+
+  it('关闭不影响 resolveModel/stream 的路由能力（目录只是建议性的）', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2']) })
+    // listModels 里已消失……
+    expect((await adapter.listModels('buddy')).map((m) => m.id)).not.toContain('glm-5.2')
+    // ……但仍可解析元数据（DSH 契约要求目录缺省不构成请求拒绝）
+    const resolved = await adapter.resolveModel('buddy', 'glm-5.2')
+    expect(resolved.id).toBe('glm-5.2')
+    expect(resolved.context?.contextWindow).toBe(1_000_000)
   })
 })

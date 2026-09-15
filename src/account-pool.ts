@@ -18,9 +18,20 @@ declare module '@deepseek-ai/cordis' {
 /** Jet Hub schema namespace（必须在 ctx.settings 中注册后才能读写） */
 export const JET_HUB_NS = 'jet-hub'
 
+/**
+ * 模型黑名单：provider id → **被关闭**的模型 id 列表。
+ *
+ * 采用**黑名单制**：只有出现在这里、且 `disabled` 为 true 的模型会被隐藏，
+ * 未记录的模型一律视为默认打开。这样服务端新增模型时无需任何配置即自动可见，
+ * 不会像白名单那样把新模型静默挡在门外。
+ */
+export type ModelDisableMap = Record<string, Record<string, boolean>>
+
 /** 账号池在 settings 中存储的值结构。 */
 interface JetHubSettingsValue {
   accounts?: ProviderAccountEntry[]
+  /** 模型黑名单（见 {@link ModelDisableMap}）。 */
+  disabledModels?: ModelDisableMap
 }
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
@@ -52,7 +63,49 @@ interface SettingsServiceLike {
  */
 const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
+  // 模型黑名单：对象（provider id → 模型 id → boolean）而非数组。
+  //
+  // 为什么用 `Schema.dict(Schema.any())` 而不是 `Schema.array(...)`：与账号
+  // 列表同理，单项字段由 AccountPool 自身在读写时保证；这里只需让 settings
+  // 的 schema 校验不把动态结构（任意 provider、任意模型 id）拒之门外。
+  //
+  // 为什么带 `.default({})`：namespace 首次注册时配置文件里没有该字段，
+  // 没有默认值的话 `scope.get()` 会返回 undefined，需在读取处层层判空。
+  disabledModels: Schema.dict(Schema.any()).default({}),
 })
+
+/**
+ * 空黑名单的共享只读实例。
+ *
+ * 适配器的 `listModels` 每次都会被模型目录调用，绝大多数 provider/时刻都
+ * 没有黑名单；共享同一个冻结集合可以避免每次调用都分配一个新 Set。
+ */
+const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
+
+/**
+ * 把 settings 里读到的原始值归一化为 {@link ModelDisableMap}。
+ *
+ * 配置文件可能被手工编辑过，也可能残留老版本格式（如数组），因此这里
+ * 逐层校验：任何一层不是对象就丢弃那一层，只保留"provider → 模型 → true"
+ * 这种合法结构，其余一律忽略而不是抛错——设置页读不出黑名单不该让整个
+ * 账号管理功能不可用。
+ */
+function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: ModelDisableMap = {}
+  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const perProvider: Record<string, boolean> = {}
+    for (const [modelId, flag] of Object.entries(value as Record<string, unknown>)) {
+      // 只把显式 true 视为"关闭"；false / 其他值既不算关闭，也不写回内存，
+      // 避免 `disabledModelsFor` 的判定与配置文件内容产生分歧。
+      if (flag === true) perProvider[modelId] = true
+    }
+    // 空表不保留：让配置文件里不留 `{ provider: {} }` 这类无意义噪音。
+    if (Object.keys(perProvider).length > 0) result[provider] = perProvider
+  }
+  return result
+}
 
 /**
  * AccountPool —— 多账号管理核心
@@ -81,6 +134,11 @@ export class AccountPool {
    * 都没有）。因此首次从 scope 载入后，这份副本即为唯一读源。
    */
   private cache: ProviderAccountEntry[] = []
+  /**
+   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理：settings 的
+   * resolved 快照在 replace() 后未必立即更新，因此加载一次后即以本副本为准）。
+   */
+  private modelCache: ModelDisableMap = {}
   /** 是否已从 settings scope 完成首次载入。 */
   private loaded = false
 
@@ -112,6 +170,9 @@ export class AccountPool {
         `[jet-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
       )
     }
+    // 黑名单是后来才加入的字段：老配置文件里没有它，缺失时保持空表
+    // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
+    this.modelCache = sanitizeDisabledModels(value?.disabledModels)
   }
 
   /** 读取账号列表（进程内权威副本）。 */
@@ -120,7 +181,12 @@ export class AccountPool {
     return this.cache
   }
 
-  /** 持久化账号列表（同时更新进程内权威副本）。 */
+  /**
+   * 持久化账号列表（同时更新进程内权威副本）。
+   *
+   * **必须连同黑名单一起写回**：settings 的 `replace()` 是整体替换，
+   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 抹掉。
+   */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
     this.loaded = true
@@ -128,7 +194,61 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，账号变更未持久化')
       return
     }
-    await this.scope.replace({ accounts })
+    await this.scope.replace({ accounts, disabledModels: this.modelCache })
+  }
+
+  /**
+   * 读取某 provider 的模型黑名单（被关闭的模型 id 集合）。
+   *
+   * 适配器只调用这一个方法，因此进程内副本就是它们的读源：设置页改开关
+   * 后，下一次 `listModels` 立即生效，无需重启或重新注册适配器。
+   */
+  disabledModelsFor(provider: string): ReadonlySet<string> {
+    this.ensureLoaded()
+    const perProvider = this.modelCache[provider]
+    if (perProvider === undefined) return EMPTY_MODEL_SET
+    const disabled = Object.keys(perProvider).filter((id) => perProvider[id] === true)
+    return disabled.length > 0 ? new Set(disabled) : EMPTY_MODEL_SET
+  }
+
+  /**
+   * 列出某 provider 的模型黑名单，供设置页渲染开关。
+   *
+   * 返回**全部键**（含显式设为 false 的），以便 UI 区分"从未设置过"与
+   * "曾被关闭又打开"——两者对用户都是"开"，但保留记录便于排查。
+   */
+  listDisabledModels(provider: string): Record<string, boolean> {
+    this.ensureLoaded()
+    return { ...(this.modelCache[provider] ?? {}) }
+  }
+
+  /**
+   * 打开/关闭某个模型。
+   *
+   * 关闭时写入 `true`；打开时**删除该键**而不是写 `false` —— 保持黑名单
+   * 里只留真正被关闭的模型，`disabledModelsFor` 的语义因此始终是
+   * "键存在且为 true 即隐藏"，配置文件也不会随开关操作无限膨胀。
+   */
+  async setModelDisabled(provider: string, modelId: string, disabled: boolean): Promise<void> {
+    const next: ModelDisableMap = { ...this.modelCache }
+    const perProvider = { ...(next[provider] ?? {}) }
+    if (disabled) perProvider[modelId] = true
+    else delete perProvider[modelId]
+    if (Object.keys(perProvider).length === 0) delete next[provider]
+    else next[provider] = perProvider
+    await this.writeModels(next)
+  }
+
+  /** 持久化模型黑名单（同时更新进程内权威副本）。 */
+  private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
+    this.modelCache = disabledModels
+    this.loaded = true
+    if (!this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，模型黑名单变更未持久化')
+      return
+    }
+    // 与 writeAccounts 对称：整体 replace 必须携带账号列表，否则会被清空。
+    await this.scope.replace({ accounts: this.cache, disabledModels })
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */
