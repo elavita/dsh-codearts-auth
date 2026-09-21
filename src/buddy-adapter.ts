@@ -12,6 +12,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   attributionHeaders,
+  CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
   LlmAdapter, LlmError,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
@@ -302,11 +303,28 @@ function errorDetail(body: string): string {
   return body
 }
 
-/** 将 HTTP 状态码映射为 harness 错误码。 */
-function httpErrorCode(status: number): string {
+/**
+ * 将 HTTP 状态码映射为 harness 错误码。
+ *
+ * 与 codearts 适配器（llm-adapter.ts）及 deepseek 适配器的 httpErrorCode
+ * 词汇保持一致：400 且命中上下文超限措辞时归为 CONTEXT_WINDOW_EXCEEDED，
+ * 而不是不可重试的 INVALID_REQUEST。否则长会话在接近窗口上限时，dsh 的
+ * 溢出恢复（dsh-compaction-basic 只对 CONTEXT_WINDOW_EXCEEDED 触发）永远
+ * 不会介入，整轮直接中断——表现为「prompt is too long: N tokens > M maximum」
+ * 报错后会话彻底卡死。
+ *
+ * 注：本修复此前只以手工补丁形式存在于 node_modules 的编译产物中
+ * （见工作空间「修复溢出分类_20260915/reapply-overflow-fix.mjs」），
+ * 一旦有人从源码重新构建就会被静默冲掉。现回流到源码，作为唯一真相源。
+ */
+function httpErrorCode(status: number, body: string): string {
   if (status === 401 || status === 403) return 'AUTH'
+  const detail = errorDetail(body)
   if (status === 429) return 'RATE_LIMIT'
-  if (status === 400) return 'INVALID_REQUEST'
+  if (status === 400) {
+    if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
+    return 'INVALID_REQUEST'
+  }
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
 }
@@ -773,12 +791,12 @@ export class BuddyAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           if (!isRateLimited(errorText)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
-            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
         }
         throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }
-      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
     }
 
     // 5. 消费 SSE 流

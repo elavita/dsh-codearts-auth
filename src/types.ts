@@ -93,6 +93,17 @@ export interface RpcCreateAccountRequest {
 export interface RpcCreateAccountResponse {
   accountId: string
   loginUrl: string
+  /**
+   * 宿主是否已用**隔离浏览器**（全新 profile、无缓存与登录态）打开登录页。
+   *
+   * - `true`：客户端**不要**再 `window.open` —— 那会在用户日常浏览器里开标签页、
+   *   复用其登录态，正是「两个 GitHub 账号却总是登录第一个」的成因。
+   * - `false`：宿主未能以隔离模式启动（如未装 Chrome/Edge），客户端回退到
+   *   `window.open`，功能可用但可能复用既有登录态。
+   */
+  browserOpened?: boolean
+  /** 隔离模式启动失败的原因（`browserOpened` 为 false 时给出，便于提示用户）。 */
+  browserMessage?: string
 }
 
 export interface RpcPollLoginRequest {

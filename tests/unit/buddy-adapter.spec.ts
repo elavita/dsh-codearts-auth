@@ -923,6 +923,49 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect(pool.recorded.every((r) => r.resetAtMs > Date.now())).toBe(true)
   })
 
+  it('WorkBuddy 国际版英文 6004 报文同样触发换号', async () => {
+    // 线上真实报文（用户上报）。早期 isRateLimited 只认中文关键词与
+    // `rate.?limit`，而该报文用的是 `frequency limit`，于是限流根本没被
+    // 识别：不记录标记、不切换账号，用户直接看到原始错误。
+    const englishBody = JSON.stringify({
+      code: 6004,
+      msg: "usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-21 09:45:56 UTC+8, alternatively, you can switch to the other models to continue using it.",
+      requestId: '505ba860-7f8b-43a2-8e19-fe13ec045a2c',
+    })
+    // 候选池里有一个可用账号，必须被切过去（acct-1 受限 → acct-2 成功）。
+    const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      product: WORKBUDDY,
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT2') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        return new Response(englishBody, { status: 400 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 关键断言 1：确实切换到了第二个账号并拿到了回复
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 关键断言 2：受限账号被记录，且重置时间取自报文本身（而非回退成 1 小时后）
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+    expect(pool.recorded[0]!.resetAtMs).toBe(Date.parse('2026-09-21 09:45:56 UTC+8'))
+  })
+
   it('全部账号限流后才报错，且错误码为不可重试的 QUOTA_EXCEEDED', async () => {
     const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
     const adapter = new BuddyAdapter({

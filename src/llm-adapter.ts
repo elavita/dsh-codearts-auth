@@ -1431,9 +1431,75 @@ export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOption
   ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
 }
 
-/** 判断错误文本是否为频率限制错误 */
+/**
+ * 解析错误体 JSON；非 JSON（或不是对象）时返回 undefined。
+ *
+ * 非 JSON 错误体是常态（网关 HTML、纯文本），不该向调用方抛错，
+ * 因此这里永不抛出。
+ */
+function parseErrorBody(body: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(body) as unknown
+    return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * buddy / workbuddy 的频率限制 code。
+ *
+ * 判定**以响应体 code 为准**（与 credits 模块同一原则）。HTTP 状态码不可
+ * 靠：同一限流实测既可能以 429 返回，也可能以 400 返回，甚至 HTTP 200 +
+ * SSE 内嵌错误。`6004` 是服务端唯一用于「用量超出频率限制」的 code，
+ * 是比任何文本正则都稳定的信号。
+ */
+const RATE_LIMIT_CODES: ReadonlySet<unknown> = new Set([6004, '6004'])
+
+/**
+ * 判断错误文本是否为频率限制错误。
+ *
+ * 中英文两种报文都必须认：
+ * - CodeBuddy 中国版：`您的使用量已超出频率限制，将在 … UTC+8 重置…`
+ * - WorkBuddy 国际版：`usage exceeds frequency limit, … your usage will
+ *   reset at 2026-09-21 09:45:56 UTC+8, alternatively, you can switch to
+ *   the other models…`
+ *
+ * 早期正则只有中文关键词 + `rate.?limit`，而国际版报文既不含中文，也不含
+ * `rate limit` 字面量（它是 `frequency limit`），于是 `isRateLimited` 对
+ * 国际版恒为 false —— 适配器的「限流换号」分支整体不进入，账号池里明明
+ * 还有可用账号，却直接把错误抛给用户，表现为「不切换账号」。
+ */
 export function isRateLimited(body: string): boolean {
-  return /频率限制|rate.?limit|使用量已超出|频率超出|重置/i.test(body)
+  const code = parseErrorBody(body)?.code
+  if (RATE_LIMIT_CODES.has(code)) return true
+  return /频率限制|使用量已超出|频率超出|重置|rate.?limit|frequency limit|too many requests|usage exceeds/i.test(body)
+}
+
+/**
+ * 从错误消息中提取重置时间（毫秒时间戳）。
+ *
+ * 中英文报文的时间戳部分同构，只是前置措辞不同，因此按
+ * `<date> <time> UTC<±offset>` 统一提取，不依赖任何语言关键词：
+ * - 中国版：`将在 2026-09-11 18:08:17 UTC+8 重置`
+ * - 国际版：`will reset at 2026-09-21 09:45:56 UTC+8, alternatively…`
+ *
+ * 早期实现只认中文的「将在 … UTC+8 重置」，且把时区**硬编码成 UTC+8**：
+ * 国际版报文匹配不到，会退回「1 小时后」——徽章显示的重置时间错误，且
+ * 1 小时后就会再次选中这个实际仍受限的账号，陷入反复撞墙。非 +8 时区的
+ * 报文（如 UTC-5）即使匹配上，也会按错误的时区解析。
+ */
+function parseResetTimeMs(message: string): number | undefined {
+  const match = /(\d{4})-(\d{2})-(\d{2})[ T]+(\d{2}):(\d{2}):(\d{2})\s*UTC\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?/i.exec(message)
+  if (match === null) return undefined
+  const [, year, month, day, hour, minute, second, sign, offsetHour, offsetMinute] = match
+  const offsetMinutes = (Number(offsetHour) * 60 + Number(offsetMinute ?? '0')) * (sign === '-' ? -1 : 1)
+  // 报文里的时间是「UTC+offset 时区的本地时间」，减去偏移才是 UTC 时刻。
+  const wallClockMs = Date.UTC(
+    Number(year), Number(month) - 1, Number(day),
+    Number(hour), Number(minute), Number(second),
+  )
+  return wallClockMs - offsetMinutes * 60_000
 }
 
 /** 从限流错误中提取重置时间 */
@@ -1441,25 +1507,16 @@ export function parseRateLimitError(
   body: string,
   currentModel: string,
 ): { modelId: string; resetTimeMs: number } | null {
-  try {
-    const data = JSON.parse(body) as Record<string, unknown>
-    const msg = typeof data.msg === 'string' ? data.msg : ''
-    // buddy格式: "您的使用量已超出频率限制，将在 2026-09-11 18:08:17 UTC+8 重置"
-    const resetMatch = /将在\s+([\d-]+\s+[\d:]+)\s+UTC[+-]\d+/.exec(msg)
-    if (resetMatch) {
-      const resetTimeStr = resetMatch[1] + ' UTC+8'
-      const resetMs = Date.parse(resetTimeStr)
-      if (!Number.isNaN(resetMs)) {
-        return { modelId: currentModel, resetTimeMs: resetMs }
-      }
-    }
-    // 标准 OpenAI 429 格式
-    if (isRateLimited(body)) {
-      // fallback: 1小时后重试
-      return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
-    }
-    return null
-  } catch {
-    return null
-  }
+  const data = parseErrorBody(body)
+  // 报文里的可读消息字段：buddy/workbuddy 用 `msg`，OpenAI 风格用 `message`。
+  const message = typeof data?.msg === 'string'
+    ? data.msg
+    : typeof data?.message === 'string'
+      ? data.message
+      : ''
+  const resetMs = parseResetTimeMs(message)
+  if (resetMs !== undefined) return { modelId: currentModel, resetTimeMs: resetMs }
+  // 拿不到重置时间（标准 OpenAI 429 格式、非 JSON 体）时回退 1 小时后重试。
+  if (isRateLimited(body)) return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
+  return null
 }

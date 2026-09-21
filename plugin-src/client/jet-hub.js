@@ -405,11 +405,17 @@ function ProviderPanel({ provider, rpcCall }) {
       accountId = res.accountId;
       loginUrl = res.loginUrl;
       if (loginUrl) {
-        // 尝试弹窗；如果被拦截则跳转到当前标签页
-        const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
-        console.log('[jet-hub] window.open result =', loginWindow);
-        if (!loginWindow || loginWindow.closed) {
-          window.location.href = loginUrl;
+        // 宿主端已用**隔离浏览器**打开登录页（全新 profile，无 Cookie 与登录态），
+        // 因此这里**不再** window.open —— 那会在用户日常浏览器里开标签页并复用其
+        // 登录态，导致 OAuth（如 GitHub）直接沿用已登录的第一个账号、无法切换。
+        // 仅在宿主未能以隔离模式启动时，才回退到 window.open。
+        if (!res.browserOpened) {
+          console.warn('[jet-hub] 宿主未能以隔离模式打开浏览器，回退到 window.open');
+          if (res.browserMessage) setError('隔离浏览器不可用（' + res.browserMessage + '），已用当前浏览器打开；可能复用已有登录态。');
+          const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
+          if (!loginWindow || loginWindow.closed) {
+            window.location.href = loginUrl;
+          }
         }
         // 轮询等待登录完成
         const pollTimer = setInterval(async () => {
@@ -417,7 +423,6 @@ function ProviderPanel({ provider, rpcCall }) {
             const pollRes = await rpcCall('login.poll', { accountId, provider });
             if (pollRes.done) {
               clearInterval(pollTimer);
-              if (loginWindow && !loginWindow.closed) loginWindow.close();
               await loadAccounts();
             }
           } catch { /* 继续轮询 */ }

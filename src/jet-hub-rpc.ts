@@ -17,6 +17,7 @@ import { AccountPool } from './account-pool.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
+import { closeIsolatedBrowser, openIsolatedBrowser, type IsolatedBrowserSession } from './isolated-browser.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
 import { claimDailyCheckin, fetchCheckinStatus, type CheckinStatus, type ClaimOutcome } from './credits.js'
@@ -348,6 +349,16 @@ export function registerJetHubRpc(
             refreshable: false,
             createdAt: Date.now(),
           })
+          // 用**隔离浏览器**打开登录页：全新 profile、无 Cookie 与登录态，
+          // 第三方 OAuth（如 GitHub）必然要求重新登录，用户才能选择另一个账号。
+          // 若让客户端 window.open，会在用户日常浏览器里开标签页并复用其登录态，
+          // 导致「有两个账号却总是登录第一个」。
+          const session = await openIsolatedBrowser(authUrl)
+          if (!session.launched) {
+            ctx.logger.warn(
+              `[jet-hub] ${product.id} 无法以隔离模式打开登录页，将回退到默认打开方式：${session.message ?? '未知原因'}`,
+            )
+          }
           // 后台异步执行完整登录流程，使用同一个 state
           runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
@@ -365,13 +376,64 @@ export function registerJetHubRpc(
             ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${err}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
             void pool.removeAccount(id).catch(() => {})
+          }).finally(() => {
+            // 无论成功、失败还是超时，都关闭隔离浏览器并删除其 profile ——
+            // 保证下一次「新建账号」拿到的仍是彻底全新的环境。
+            void closeIsolatedBrowser(session).then((removed) => {
+              if (!removed) {
+                ctx.logger.warn(
+                  `[jet-hub] 隔离浏览器 profile 未能删除（可能仍被占用）：${session.profileDir}`,
+                )
+              }
+            })
           })
-          return { ok: true, value: { accountId: id, loginUrl: authUrl } }
+          return {
+            ok: true,
+            value: {
+              accountId: id,
+              loginUrl: authUrl,
+              browserOpened: session.launched,
+              ...session.launched ? {} : { browserMessage: session.message ?? '无法以隔离模式打开浏览器' },
+            },
+          }
         } else if (provider === 'codearts') {
           // codearts login 是 OAuth 回调方式，不支持纯获取 URL
-          // 直接同步执行（需等待回调完成）
-          const loginResult = await codearts.login({ refName, accountId: id, pool })
-          return { ok: true, value: { accountId: id, loginUrl: loginResult.loginUrl } }
+          // 直接同步执行（需等待回调完成）。
+          // 浏览器打开时机由流程内部决定（回调端口就绪后才构造 loginUrl），
+          // 因此这里注入 openBrowser 而非预先打开。
+          let isolated: IsolatedBrowserSession | undefined
+          let browserOpened = false
+          let browserMessage: string | undefined
+          try {
+            const loginResult = await codearts.login({
+              refName,
+              accountId: id,
+              pool,
+              openBrowser: async (url: string) => {
+                isolated = await openIsolatedBrowser(url)
+                browserOpened = isolated.launched
+                if (!isolated.launched) {
+                  browserMessage = isolated.message ?? '无法以隔离模式打开浏览器'
+                  ctx.logger.warn(`[jet-hub] codearts 隔离浏览器启动失败，回退默认打开方式：${browserMessage}`)
+                  const { openBrowser } = await import('./login.js')
+                  openBrowser(url)
+                }
+              },
+            })
+            return {
+              ok: true,
+              value: {
+                accountId: id,
+                loginUrl: loginResult.loginUrl,
+                browserOpened,
+                ...browserMessage === undefined ? {} : { browserMessage },
+              },
+            }
+          } finally {
+            // 登录完成/超时/失败后都要清掉隔离 profile，
+            // 保证下次「新建账号」仍是全新环境。
+            await closeIsolatedBrowser(isolated)
+          }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
